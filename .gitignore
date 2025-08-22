@@ -1,0 +1,28 @@
+# Unreal Engine
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+.vscode/
+.vs/
+*.sln
+*.opensdf
+*.suo
+*.sdf
+*.pdb
+*.log
+*.db
+*.ipch
+*.tmp
+*.obj
+*.exe
+*.dll
+
+# Build
+Build/
+
+# Ignore user settings
+*.user
+*.userprefs
+*.swp
+

@@ -1,0 +1,23 @@
+// Minimal compute shader: SWE -> Depth normalized, writes to R32F UAV
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float> InSWE;
+SamplerState InSWESampler;
+RWTexture2D<float> OutSnowDepth;
+float InvMaxDepth; // multiply Depth by this to normalize [0,1]
+int2 OutputSize;
+
+[numthreads(8,8,1)]
+void MainCS(uint3 DTid : SV_DispatchThreadID)
+{
+	if (DTid.x >= (uint)OutputSize.x || DTid.y >= (uint)OutputSize.y)
+	{
+		return;
+	}
+	int2 P = int2(DTid.xy);
+	float swe_mm = InSWE.Load(int3(P, 0));
+	float depth_m = swe_mm / 100.0; // temporary density mapping
+	float norm = depth_m * InvMaxDepth;
+	OutSnowDepth[P] = saturate(norm);
+}

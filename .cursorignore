@@ -1,0 +1,19 @@
+# Unreal noise
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+.vs/
+*.VC.db
+*.sdf
+*.opensdf
+*.ipch
+*.user
+*.opendb
+
+# Build artifacts
+*.pdb
+*.obj
+*.exe
+*.dll
+

@@ -1,0 +1,32 @@
+#include "Common.usf"
+#define UINT_FLOAT_SCALE 100000.0f
+
+void MainVertexShader(
+	float4 InPosition : ATTRIBUTE0,
+	float2 InUV : ATTRIBUTE1,
+	out float2 OutUV : TEXCOORD0,
+	out float4 OutPosition : SV_POSITION
+	)
+{
+	OutPosition = InPosition;
+	OutUV = InUV;
+}
+
+StructuredBuffer<float> SnowInputBuffer : register(s0);
+
+StructuredBuffer<uint> MaxSnowInputBuffer;
+
+void MainPixelShader(
+	in float2 uv : TEXCOORD0,
+	in uint instanceId : SV_InstanceID,
+	out float4 OutColor : SV_Target0
+	)
+{
+	int2 coord = int2(uv.x, uv.y);
+	int snowBufferIndex = coord.x + SimulationPSConstants.CellsDimensionX * coord.y;
+	float maxSnow = (float)MaxSnowInputBuffer[0] / UINT_FLOAT_SCALE;
+
+	float snowAmount = (float)SnowInputBuffer[snowBufferIndex] / maxSnow;
+
+	OutColor = float4(snowAmount, snowAmount, snowAmount, 1);
+}
