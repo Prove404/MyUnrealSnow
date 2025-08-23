@@ -21,6 +21,10 @@
 		{
 			"Name": "UnrealSnow",
 			"Enabled": true
+		},
+		{
+			"Name": "VirtualHeightfieldMesh",
+			"Enabled": true
 		}
 	]
 }

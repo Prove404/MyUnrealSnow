@@ -8,7 +8,7 @@ public class UnrealSnow : ModuleRules
 
 		PublicDependencyModuleNames.AddRange(new string[]
 		{
-			"Core", "CoreUObject", "Engine", "RenderCore", "RHI", "Projects", "DeveloperSettings"
+			"Core", "CoreUObject", "Engine", "InputCore", "RenderCore", "RHI", "Projects", "DeveloperSettings", "ProceduralMeshComponent"
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[]

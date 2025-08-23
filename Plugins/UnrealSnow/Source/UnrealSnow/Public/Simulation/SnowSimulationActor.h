@@ -5,7 +5,16 @@
 #include "Components/StaticMeshComponent.h"
 // forward include allowed for clarity
 #include "Weather/StochasticWeatherProvider.h"
+#pragma region ForwardDecls
 class UTextureRenderTarget2D;
+class AVirtualHeightfieldMesh;
+class UMaterialInstanceDynamic;
+class UVirtualHeightfieldMeshComponent;
+#pragma endregion
+#include "ProceduralMeshComponent.h"
+#include "Kismet/GameplayStatics.h"
+#include "Components/PrimitiveComponent.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "SnowSimulationActor.generated.h"
 
 UCLASS()
@@ -56,6 +65,14 @@ protected:
 	UPROPERTY(VisibleAnywhere, Category="UnrealSnow|Debug")
 	UStaticMeshComponent* DebugPlane = nullptr;
 
+	// Debug helpers
+	UPROPERTY(EditAnywhere, Category="Snow|Debug")
+	float DebugDisplacementBoost = 1.f;
+
+	// Optionally hide any legacy snow plane mesh if attached to this actor
+	UPROPERTY(EditAnywhere, Category="Snow|Debug")
+	bool bHideLegacySnowPlane = true;
+
 	// Pick a Blueprint class for the provider in the Details panel (no inline expansion).
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="UnrealSnow|Weather")
 	TSoftClassPtr<UStochasticWeatherProvider> WeatherProviderClass;
@@ -94,9 +111,75 @@ protected:
 	UPROPERTY(EditAnywhere, Category="UnrealSnow|Outputs")
 	class USWROutExporter* SWROutExporter = nullptr;
 
+	// --- Snow displacement (runtime heightfield) ---
+	UPROPERTY(EditAnywhere, Category="Snow|Displacement")
+	float SnowDensity = 300.f; // kg m^-3 (use to convert SWE->depth)
+
+	UPROPERTY(EditAnywhere, Category="Snow|Displacement")
+	bool bDepthFromSWE = true; // depth = SWE * (1000 / SnowDensity)
+
+	UPROPERTY(EditAnywhere, Category="Snow|Displacement")
+	FName SnowWriterActorTag = "SnowRVTWriter"; // actor in level with this tag
+
+	UPROPERTY(EditAnywhere, Category="Snow|Viz")
+	FName SnowDepthParam = TEXT("SnowDepthTex"); // material parameter name
+
+	UPROPERTY(EditAnywhere, Category="Snow|Viz")
+	FName SnowDepthScaleParam = TEXT("SnowDepthToWorld");
+
+	UPROPERTY(EditAnywhere, Category="Snow|Viz")
+	int32 DepthResX = 512;
+
+	UPROPERTY(EditAnywhere, Category="Snow|Viz")
+	int32 DepthResY = 512;
+
+	UPROPERTY(Transient)
+	UTexture2D* SnowDepthTex = nullptr; // R16F meters
+
+	TArray<float> SnowDepthData;
+	FUpdateTextureRegion2D SnowDepthRegion;
+
+	// Writer MID cache
+	UPROPERTY(Transient)
+	UMaterialInstanceDynamic* SnowWriterMID = nullptr;
+
+	// --- Procedural snow surface mesh ---
+	UPROPERTY(VisibleAnywhere, Category="Snow|Mesh")
+	UProceduralMeshComponent* SnowMesh = nullptr;
+
+	UPROPERTY(EditAnywhere, Category="Snow|Mesh")
+	bool bUseProceduralMesh = false;
+
+	UPROPERTY(EditAnywhere, Category="Snow|Mesh") int32 GridX = 128;
+	UPROPERTY(EditAnywhere, Category="Snow|Mesh") int32 GridY = 128;
+	UPROPERTY(EditAnywhere, Category="Snow|Mesh") float WorldSizeX = 5000.f;
+	UPROPERTY(EditAnywhere, Category="Snow|Mesh") float WorldSizeY = 5000.f;
+
+	// Physics/displacement
+	UPROPERTY(EditAnywhere, Category="Snow|Physics") float DisplacementScale = 1.f;
+	UPROPERTY(EditAnywhere, Category="Snow|Physics") bool bSmoothDepth = true;
+	UPROPERTY(EditAnywhere, Category="Snow|Physics") int32 SmoothKernelRadius = 1;
+
+	// SIMPLE INTERNAL SWE FALLBACK (meters water equivalent)
+	TArray<float> SWE_Grid;
+	TArray<float> SWE_Temp;
+
+	// ===== Procedural snow mesh buffers =====
+	UPROPERTY() TArray<FVector> BaseVerts;     // Base terrain vertices (sampled once)
+	UPROPERTY() TArray<FVector> DynVerts;      // Deformed vertices (Base + snow depth)
+	UPROPERTY() TArray<FVector> Normals;
+	UPROPERTY() TArray<FVector2D> UVs;
+	UPROPERTY() TArray<FProcMeshTangent> Tangents;
+	UPROPERTY() TArray<int32> Indices;
+
+	// Utility
+	int32 VertIndex(int32 ix, int32 iy) const { return iy*(GridX+1) + ix; }
+	FVector2D GridToLocalXY(int32 ix, int32 iy) const;
+
 public:
 	ASnowSimulationActor();
 	virtual void BeginPlay() override;
+	virtual void OnConstruction(const FTransform& Xform) override;
 	virtual void Tick(float DeltaSeconds) override;
 
 	// Editor/UI helpers
@@ -114,6 +197,84 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category="UnrealSnow|Simulation")
 	float GetMeanSWRout() const { return LastMeanSWRout; }
+
+	// Optional: expose for Blueprints if you want manual hookups
+	UFUNCTION(BlueprintCallable, Category="Snow|Viz")
+	UTexture2D* GetSnowDepthTexture() const { return SnowDepthTex; }
+
+	void InitSnowDepthTexture();
+	void UpdateSnowDepthTexture();
+	void WireSnowDepthToVHM()
+	{
+		UWorld* W = GetWorld(); 
+		if (!W || !SnowDepthTex) return;
+
+		TArray<AActor*> Actors;
+		UGameplayStatics::GetAllActorsOfClass(W, AActor::StaticClass(), Actors);
+
+		int32 Wired = 0;
+		for (AActor* A : Actors)
+		{
+			if (!A) continue;
+
+			TArray<UPrimitiveComponent*> Prims;
+			A->GetComponents<UPrimitiveComponent>(Prims);
+			for (UPrimitiveComponent* P : Prims)
+			{
+				if (!P) continue;
+
+				const FString ClassName = P->GetClass()->GetName(); // "VirtualHeightfieldMeshComponent"
+				if (!ClassName.Contains(TEXT("VirtualHeightfieldMeshComponent")))
+					continue;
+
+				if (UMaterialInstanceDynamic* MID = P->CreateAndSetMaterialInstanceDynamic(0))
+				{
+					MID->SetTextureParameterValue(SnowDepthParam, SnowDepthTex);
+					MID->SetScalarParameterValue(SnowDepthScaleParam, 500.f);
+					P->SetMaterial(0, MID);
+					++Wired;
+				}
+			}
+		}
+		UE_LOG(LogTemp, Warning, TEXT("[Snow] Wired VHM comps: %d"), Wired);
+	}
+
+	// Procedural mesh API
+	UFUNCTION(BlueprintCallable, Category="Snow|Mesh")
+	void RebuildSnowMesh();
+
+	UFUNCTION(BlueprintCallable, Category="Snow|Mesh")
+	float GetSWE(int32 ix, int32 iy) const;
+
+	// Safety: ensure mesh buffers are ready before updating
+	bool HasValidMeshBuffers() const { return DynVerts.Num() == (GridX+1)*(GridY+1); }
+
+	// Console exec for quick mesh/bounds debug
+	UFUNCTION(Exec)
+	void SnowMeshInfo();
+
+	// Console exec helpers
+	UFUNCTION(Exec)
+	void SnowMove(float X, float Y, float Z);           // set actor world location (cm)
+	UFUNCTION(Exec)
+	void SnowHere(float SizeMeters=500.0f); // move actor under camera & set size
+	UFUNCTION(Exec)
+	void SnowSize(float SizeMeters);        // just resize patch
+	UFUNCTION(Exec)
+	void SnowLogCenter();                   // print sample trace info
+
+	// Debug options
+	UPROPERTY(EditAnywhere, Category="Snow|Debug")
+	bool bAutoSnapAtBeginPlay = true; // snap once at PIE
+
+	// SWE grid external setter and clamped getter
+	UFUNCTION(BlueprintCallable, Category="Snow|SWE")
+	void SetSWEAt(int32 X, int32 Y, float SWE_m);
+	float GetSWE_Clamped(int32 ix, int32 iy) const;
+
+	// Toggle internal precip growth hack
+	UPROPERTY(EditAnywhere, Category="Snow|SWE")
+	bool bUseInternalPrecipHack = false;
 
 private:
 	// State fields for a minimal CPU simulation
@@ -137,6 +298,10 @@ private:
 	void InitGrid();
 	void EnsureResources();
 	void RunStep(float DeltaSeconds);
+
+	// SWE helpers
+	void EnsureSWEStorage();
+	void SmoothSWE();
 };
 
 
