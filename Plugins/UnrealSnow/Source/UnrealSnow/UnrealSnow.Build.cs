@@ -13,7 +13,7 @@ public class UnrealSnow : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
-			"Slate", "SlateCore", "Renderer"
+			"Slate", "SlateCore", "Renderer", "Landscape", "VirtualHeightfieldMesh", "Engine", "UMG"
 		});
 
 		PublicIncludePaths.AddRange(new[] {

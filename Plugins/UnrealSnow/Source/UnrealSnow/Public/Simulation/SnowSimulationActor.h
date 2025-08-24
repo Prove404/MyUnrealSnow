@@ -10,11 +10,15 @@ class UTextureRenderTarget2D;
 class AVirtualHeightfieldMesh;
 class UMaterialInstanceDynamic;
 class UVirtualHeightfieldMeshComponent;
+class USceneComponent;
 #pragma endregion
 #include "ProceduralMeshComponent.h"
 #include "Kismet/GameplayStatics.h"
 #include "Components/PrimitiveComponent.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#ifndef SNOW_WITH_LEGACY_PROCMESH
+#define SNOW_WITH_LEGACY_PROCMESH 0
+#endif
 #include "SnowSimulationActor.generated.h"
 
 UCLASS()
@@ -69,6 +73,14 @@ protected:
 	UPROPERTY(EditAnywhere, Category="Snow|Debug")
 	float DebugDisplacementBoost = 1.f;
 
+	// Ensure we have a root scene component
+	UPROPERTY(VisibleDefaultsOnly, Category="Snow")
+	TObjectPtr<USceneComponent> Root = nullptr;
+
+	// Deprecated legacy toggle for old procedural mesh path
+	UPROPERTY(EditAnywhere, Category="Legacy", AdvancedDisplay, meta=(DeprecatedProperty, DeprecationMessage="Procedural mesh path removed; use RVT+VHM."))
+	bool bEnableLegacyProceduralMesh = false;
+
 	// Optionally hide any legacy snow plane mesh if attached to this actor
 	UPROPERTY(EditAnywhere, Category="Snow|Debug")
 	bool bHideLegacySnowPlane = true;
@@ -112,8 +124,21 @@ protected:
 	class USWROutExporter* SWROutExporter = nullptr;
 
 	// --- Snow displacement (runtime heightfield) ---
-	UPROPERTY(EditAnywhere, Category="Snow|Displacement")
-	float SnowDensity = 300.f; // kg m^-3 (use to convert SWE->depth)
+
+	// Pick the VHM actor in the level; we will resolve its component at runtime.
+	UPROPERTY(EditAnywhere, Category="Snow|VHM")
+	TSoftObjectPtr<AActor> TargetVHMActor;
+
+	// Base material to use on the VHM if it has no material assigned.
+	UPROPERTY(EditAnywhere, Category="Snow|VHM")
+	TSoftObjectPtr<UMaterialInterface> DefaultVHMMaterial;
+
+	// Optional: retry once if VHM not ready at BeginPlay
+	UPROPERTY(EditAnywhere, Category="Snow|VHM")
+	bool bRetryWireIfMissing = true;
+
+	UPROPERTY(EditAnywhere, Category="Snow|VHM", meta=(ClampMin="0.01", UIMin="0.1", UIMax="5.0"))
+	float WireRetryDelay = 0.2f; // seconds
 
 	UPROPERTY(EditAnywhere, Category="Snow|Displacement")
 	bool bDepthFromSWE = true; // depth = SWE * (1000 / SnowDensity)
@@ -144,8 +169,7 @@ protected:
 	UMaterialInstanceDynamic* SnowWriterMID = nullptr;
 
 	// --- Procedural snow surface mesh ---
-	UPROPERTY(VisibleAnywhere, Category="Snow|Mesh")
-	UProceduralMeshComponent* SnowMesh = nullptr;
+// No UPROPERTY for legacy procedural mesh; keep a private raw pointer below
 
 	UPROPERTY(EditAnywhere, Category="Snow|Mesh")
 	bool bUseProceduralMesh = false;
@@ -180,7 +204,24 @@ public:
 	ASnowSimulationActor();
 	virtual void BeginPlay() override;
 	virtual void OnConstruction(const FTransform& Xform) override;
+	virtual void PostLoad() override;
 	virtual void Tick(float DeltaSeconds) override;
+
+	// SWE [m w.e.] -> depth [m] via depth = SWE * (1000 / SnowDensity)
+	UPROPERTY(EditAnywhere, Category="Snow|Physics")
+	float SnowDensity = 300.f; // kg/m^3 (fresh-dry ~100–300, settled ~300–450)
+
+	// When true, store depth normalized to [0..1] in the R16F texture.
+	UPROPERTY(EditAnywhere, Category="Snow|RVT")
+	bool bNormalizeDepthTexture = true;
+
+	// If normalized, 1.0 in the texture corresponds to this many meters.
+	UPROPERTY(EditAnywhere, Category="Snow|RVT", meta=(EditCondition="bNormalizeDepthTexture", ClampMin="0.01", UIMin="0.1", UIMax="5.0"))
+	float DepthRangeMeters = 2.0f;
+
+	// Safety clamp to avoid runaway values
+	UPROPERTY(EditAnywhere, Category="Snow|RVT", meta=(ClampMin="0.0", UIMin="0.0", UIMax="10.0"))
+	float MaxClampMeters = 5.0f;
 
 	// Editor/UI helpers
 	UFUNCTION(BlueprintCallable, Category="UnrealSnow|Simulation")
@@ -204,47 +245,20 @@ public:
 
 	void InitSnowDepthTexture();
 	void UpdateSnowDepthTexture();
-	void WireSnowDepthToVHM()
-	{
-		UWorld* W = GetWorld(); 
-		if (!W || !SnowDepthTex) return;
+	void WireSnowDepthToVHM();
 
-		TArray<AActor*> Actors;
-		UGameplayStatics::GetAllActorsOfClass(W, AActor::StaticClass(), Actors);
-
-		int32 Wired = 0;
-		for (AActor* A : Actors)
-		{
-			if (!A) continue;
-
-			TArray<UPrimitiveComponent*> Prims;
-			A->GetComponents<UPrimitiveComponent>(Prims);
-			for (UPrimitiveComponent* P : Prims)
-			{
-				if (!P) continue;
-
-				const FString ClassName = P->GetClass()->GetName(); // "VirtualHeightfieldMeshComponent"
-				if (!ClassName.Contains(TEXT("VirtualHeightfieldMeshComponent")))
-					continue;
-
-				if (UMaterialInstanceDynamic* MID = P->CreateAndSetMaterialInstanceDynamic(0))
-				{
-					MID->SetTextureParameterValue(SnowDepthParam, SnowDepthTex);
-					MID->SetScalarParameterValue(SnowDepthScaleParam, 500.f);
-					P->SetMaterial(0, MID);
-					++Wired;
-				}
-			}
-		}
-		UE_LOG(LogTemp, Warning, TEXT("[Snow] Wired VHM comps: %d"), Wired);
-	}
-
-	// Procedural mesh API
-	UFUNCTION(BlueprintCallable, Category="Snow|Mesh")
-	void RebuildSnowMesh();
+// Legacy procedural mesh API (deprecated)
+UFUNCTION(BlueprintCallable, Category="Legacy", meta=(DeprecatedFunction, DeprecationMessage="Procedural mesh path removed; use RVT+VHM."))
+void RebuildSnowMesh();
+UFUNCTION(BlueprintCallable, Category="Legacy", meta=(DeprecatedFunction))
+void BuildProceduralSnowPlane();
+UFUNCTION(BlueprintCallable, Category="Legacy", meta=(DeprecatedFunction))
+void UpdateProceduralMesh();
 
 	UFUNCTION(BlueprintCallable, Category="Snow|Mesh")
 	float GetSWE(int32 ix, int32 iy) const;
+
+// (Stubs implemented in cpp when legacy is disabled.)
 
 	// Safety: ensure mesh buffers are ready before updating
 	bool HasValidMeshBuffers() const { return DynVerts.Num() == (GridX+1)*(GridY+1); }
@@ -302,6 +316,11 @@ private:
 	// SWE helpers
 	void EnsureSWEStorage();
 	void SmoothSWE();
+
+	// Optional non-UPROPERTY pointer to any legacy procedural mesh component
+#if SNOW_WITH_LEGACY_PROCMESH
+	class UProceduralMeshComponent* LegacyProcMesh = nullptr; // no UPROPERTY on purpose
+#endif
 };
 
 

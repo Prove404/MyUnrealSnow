@@ -25,9 +25,22 @@
 #include "Engine/EngineTypes.h"
 #include "TimerManager.h"
 #include "Math/Float16.h"
+#include "LandscapeProxy.h"
+#include "EngineUtils.h"
+#include "VirtualHeightfieldMeshComponent.h"
+
+#ifndef SNOW_WITH_LEGACY_PROCMESH
+#define SNOW_WITH_LEGACY_PROCMESH 0
+#endif
 
 // Forward decl from SnowCS.cpp
 void RunSnowCS_RenderTarget(class UTextureRenderTarget2D* RT, class UTextureRenderTarget2D* SWETexture, float InvMaxDepth);
+
+#if !SNOW_WITH_LEGACY_PROCMESH
+// Stubs to satisfy any accidental references in cooked BPs
+void ASnowSimulationActor::BuildProceduralSnowPlane(){}
+void ASnowSimulationActor::UpdateProceduralMesh(){}
+#endif
 
 namespace
 {
@@ -48,6 +61,19 @@ namespace
 	}
 }
 
+// Diagnostics helper to introspect actor components and child VHMs
+static void DumpActorComponents(AActor* A, const TCHAR* Tag)
+{
+    if (!A) { UE_LOG(LogTemp, Warning, TEXT("[Snow] %s: <null actor>"), Tag); return; }
+    UE_LOG(LogTemp, Warning, TEXT("[Snow] %s: Actor=%s Class=%s"), Tag, *A->GetName(), *A->GetClass()->GetName());
+    TArray<UActorComponent*> Cs; A->GetComponents(Cs);
+    UE_LOG(LogTemp, Warning, TEXT("[Snow]   Direct components: %d"), Cs.Num());
+    for (UActorComponent* C : Cs) { if (C) UE_LOG(LogTemp, Warning, TEXT("      - %s"), *C->GetClass()->GetName()); }
+    TInlineComponentArray<UVirtualHeightfieldMeshComponent*> VHMs(A, /*bIncludeFromChildActors*/ true);
+    UE_LOG(LogTemp, Warning, TEXT("[Snow]   Found VHM comps (incl. children): %d"), VHMs.Num());
+    for (auto* V : VHMs) { if (V) UE_LOG(LogTemp, Warning, TEXT("      * VHM: %s"), *V->GetName()); }
+}
+
 static void LogSWEStats(const TArray<float>& SWE, int32 GX, int32 GY, float SnowDensity, float DisplacementScale)
 {
 	if (SWE.Num() == 0) return;
@@ -61,43 +87,61 @@ static void LogSWEStats(const TArray<float>& SWE, int32 GX, int32 GY, float Snow
 		mean, maxSWE, maxDepth_m, maxDisp_cm, DisplacementScale);
 }
 
+// Helper to disable and hide a component safely (used for legacy procedural mesh cleanup)
+static void DisableAndHideComponent(UActorComponent* Comp)
+{
+    if (!Comp) return;
+    Comp->SetComponentTickEnabled(false);
+    if (UPrimitiveComponent* Prim = Cast<UPrimitiveComponent>(Comp))
+    {
+        Prim->SetHiddenInGame(true);
+        Prim->SetVisibility(false, true);
+        Prim->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    }
+}
+
+// Remove any ProceduralMeshComponent instances without directly depending on its header
+static void RemoveLegacyProcMeshComponents(AActor* Owner)
+{
+    if (!Owner) return;
+    TArray<UActorComponent*> AllComps;
+    Owner->GetComponents(AllComps);
+    for (UActorComponent* C : AllComps)
+    {
+        if (!C) continue;
+        if (C->GetClass()->GetName().Contains(TEXT("ProceduralMeshComponent")))
+        {
+            DisableAndHideComponent(C);
+            C->DestroyComponent(true);
+        }
+    }
+}
+
 ASnowSimulationActor::ASnowSimulationActor()
 {
 	PrimaryActorTick.bCanEverTick = true;
 
-	if (!RootComponent)
-	{
-		USceneComponent* Root = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
-		SetRootComponent(Root);
-	}
-	SnowMesh = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("SnowMesh"));
-	SnowMesh->SetupAttachment(RootComponent);
-	SnowMesh->SetMobility(EComponentMobility::Movable);
-	SnowMesh->bUseAsyncCooking = true;
-	SnowMesh->SetVisibility(true, true);
-	SnowMesh->SetHiddenInGame(false);
-	SnowMesh->bRenderInMainPass = true;
-	SnowMesh->SetCastShadow(false);
-	SnowMesh->SetBoundsScale(3.0f);
+	Root = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
+	SetRootComponent(Root);
+}
 
-	// Default to hidden/disabled (VHM primary path)
-	if (SnowMesh)
-	{
-		SnowMesh->SetHiddenInGame(true);
-		SnowMesh->SetVisibility(false, true);
-		SnowMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	}
+void ASnowSimulationActor::PostLoad()
+{
+	Super::PostLoad();
+	RemoveLegacyProcMeshComponents(this);
 }
 
 void ASnowSimulationActor::OnConstruction(const FTransform& Xform)
 {
 	Super::OnConstruction(Xform);
-	RebuildSnowMesh();
 }
 
 void ASnowSimulationActor::BeginPlay()
 {
 	Super::BeginPlay();
+
+	// Safety: remove any legacy procedural mesh components
+	RemoveLegacyProcMeshComponents(this);
 
 	if (bAutoSnapAtBeginPlay)
 	{
@@ -156,21 +200,37 @@ void ASnowSimulationActor::BeginPlay()
 					MeshComp->SetMaterial(0, SnowWriterMID);
 					if (SnowWriterMID && SnowDepthTex)
 					{
+						// Bind the dynamic R16F depth texture
 						SnowWriterMID->SetTextureParameterValue(SnowDepthParam, SnowDepthTex);
+						// Verify texture parameter binding
+						{
+							UTexture* BoundTex = nullptr;
+							const bool bGot = SnowWriterMID->GetTextureParameterValue(FName("SnowDepthTex"), BoundTex);
+							if (bGot && BoundTex == SnowDepthTex)
+							{
+								UE_LOG(LogTemp, Warning, TEXT("[Snow] Texture param successfully bound."));
+							}
+							else
+							{
+								UE_LOG(LogTemp, Error, TEXT("[Snow] Texture param binding FAILED."));
+							}
+						}
+						// Optional: also push the scalar params so you don’t set them by hand
+						SnowWriterMID->SetScalarParameterValue(FName("DisplacementScale"), DisplacementScale);
+						SnowWriterMID->SetScalarParameterValue(FName("DepthRangeMeters"), DepthRangeMeters);
+						const float DomainSizeCm = WorldSizeX;
+						const FVector2D OriginXY(GetActorLocation().X - DomainSizeCm * 0.5f,
+							GetActorLocation().Y - DomainSizeCm * 0.5f);
+						SnowWriterMID->SetVectorParameterValue(FName("SnowOriginWS"),
+							FLinearColor(OriginXY.X, OriginXY.Y, 0, 0));
+						SnowWriterMID->SetScalarParameterValue(FName("SnowInvSize"), (DomainSizeCm != 0.f) ? (1.0f / DomainSizeCm) : 0.f);
 					}
 				}
 			}
 		}
 	}
 
-	// Build the procedural snow mesh surface
-	RebuildSnowMesh();
-	if (bHideLegacySnowPlane)
-	{
-		// If your actor has an older plane component, hide it here, e.g.:
-		// if (SnowPlaneComponent) SnowPlaneComponent->SetVisibility(false, true);
-		// (Leave as-is if you don’t have such a component.)
-	}
+	// Procedural mesh path removed
 	EnsureSWEStorage();
 
 	// Hide legacy primitives except SnowMesh so only the procedural surface is visible
@@ -179,7 +239,7 @@ void ASnowSimulationActor::BeginPlay()
 		GetComponents<UPrimitiveComponent>(PrimComps);
 		for (UPrimitiveComponent* P : PrimComps)
 		{
-			if (P && P != SnowMesh)
+			if (P)
 			{
 				P->SetHiddenInGame(true);
 				P->SetVisibility(false, true);
@@ -382,46 +442,64 @@ void ASnowSimulationActor::Tick(float DeltaSeconds)
 
 	SmoothSWE();
 
+	// Assert depth values sanity to catch the km bug early
+	float MaxDepthMeters = 0.f;
+	{
+		const float rhoWater_local = 1000.f;
+		if (SWE_Grid.Num() == GridX * GridY)
+		{
+			for (int32 i = 0; i < SWE_Grid.Num(); ++i)
+			{
+				const float depth_m = SWE_Grid[i] * (rhoWater_local / FMath::Max(1.f, SnowDensity));
+				MaxDepthMeters = FMath::Max(MaxDepthMeters, depth_m);
+			}
+		}
+	}
+	ensureAlwaysMsgf(MaxDepthMeters < 50.f, TEXT("[Snow] Depth sanity check failed: %.3fm (expected < 50m). Check SWE->depth scale."), MaxDepthMeters);
+
 	LogSWEStats(SWE_Grid, GridX, GridY, SnowDensity, DisplacementScale);
 
-	if (!HasValidMeshBuffers())
+#if SNOW_WITH_LEGACY_PROCMESH
+	if (bEnableLegacyProceduralMesh)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[Snow] Mesh buffers not ready; calling RebuildSnowMesh()"));
-		RebuildSnowMesh();
-		if (!HasValidMeshBuffers()) return;
-	}
+		if (!HasValidMeshBuffers())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[Snow] Mesh buffers not ready; procedural path removed"));
+			if (!HasValidMeshBuffers()) return;
+		}
 
-	const float rhoWater = 1000.f;
-	const int32 VX = GridX + 1;
-	const int32 VY = GridY + 1;
-	if (DynVerts.Num() == VX * VY)
-	{
-		for (int32 iy = 0; iy < VY; ++iy)
+		const float rhoWater = 1000.f;
+		const int32 VX = GridX + 1;
+		const int32 VY = GridY + 1;
+		if (DynVerts.Num() == VX * VY)
 		{
-			for (int32 ix = 0; ix < VX; ++ix)
+			for (int32 iy = 0; iy < VY; ++iy)
 			{
-				const int32 vi = VertIndex(ix, iy);
-				FVector v = BaseVerts.IsValidIndex(vi) ? BaseVerts[vi] : DynVerts[vi];
-				const int32 cx = FMath::Clamp(ix, 0, GridX - 1);
-				const int32 cy = FMath::Clamp(iy, 0, GridY - 1);
-				const float SWE_m = GetSWE_Clamped(cx, cy);
-				const float depth_m = SWE_m * (rhoWater / FMath::Max(1.f, SnowDensity));
-				v.Z = BaseVerts[vi].Z + depth_m * 100.f * DisplacementScale * DebugDisplacementBoost;
-				DynVerts[vi] = v;
+				for (int32 ix = 0; ix < VX; ++ix)
+				{
+					const int32 vi = VertIndex(ix, iy);
+					FVector v = BaseVerts.IsValidIndex(vi) ? BaseVerts[vi] : DynVerts[vi];
+					const int32 cx = FMath::Clamp(ix, 0, GridX - 1);
+					const int32 cy = FMath::Clamp(iy, 0, GridY - 1);
+					const float SWE_m = GetSWE_Clamped(cx, cy);
+					const float depth_m = SWE_m * (rhoWater / FMath::Max(1.f, SnowDensity));
+					v.Z = BaseVerts[vi].Z + depth_m * 100.f * DisplacementScale * DebugDisplacementBoost;
+					DynVerts[vi] = v;
+				}
 			}
-		}
-		if (SnowMesh)
-		{
-			if (DynVerts.Num() != (GridX+1)*(GridY+1))
+			if (SnowMesh)
 			{
-				UE_LOG(LogTemp, Warning, TEXT("[Snow] DynVerts size %d != expected %d; rebuilding"),
-					DynVerts.Num(), (GridX+1)*(GridY+1));
-				RebuildSnowMesh();
-				if (DynVerts.Num() != (GridX+1)*(GridY+1)) return;
+				if (DynVerts.Num() != (GridX+1)*(GridY+1))
+				{
+					UE_LOG(LogTemp, Warning, TEXT("[Snow] DynVerts size %d != expected %d; procedural path removed"),
+						DynVerts.Num(), (GridX+1)*(GridY+1));
+					if (DynVerts.Num() != (GridX+1)*(GridY+1)) return;
+				}
+				SnowMesh->UpdateMeshSection_LinearColor(0, DynVerts, Normals, UVs, TArray<FLinearColor>(), Tangents);
 			}
-			SnowMesh->UpdateMeshSection_LinearColor(0, DynVerts, Normals, UVs, TArray<FLinearColor>(), Tangents);
 		}
 	}
+#endif
 }
 
 void ASnowSimulationActor::RunStep(float DeltaSeconds)
@@ -604,9 +682,20 @@ void ASnowSimulationActor::InitSnowDepthTexture()
 {
 	SnowDepthTex = UTexture2D::CreateTransient(DepthResX, DepthResY, PF_R16F);
 	SnowDepthTex->SRGB = false;
-	SnowDepthTex->Filter = TF_Bilinear;
+	SnowDepthTex->CompressionSettings = TC_HDR;
+	SnowDepthTex->Filter = TF_Nearest;
 	SnowDepthTex->AddressX = TA_Clamp; SnowDepthTex->AddressY = TA_Clamp;
 	SnowDepthTex->UpdateResource();
+
+	// Zero-initialize first mip once after creation
+	if (SnowDepthTex && SnowDepthTex->GetPlatformData() && SnowDepthTex->GetPlatformData()->Mips.Num() > 0)
+	{
+		FTexture2DMipMap& Mip = SnowDepthTex->GetPlatformData()->Mips[0];
+		void* Data = Mip.BulkData.Lock(LOCK_READ_WRITE);
+		FMemory::Memset(Data, 0, Mip.BulkData.GetBulkDataSize());
+		Mip.BulkData.Unlock();
+		SnowDepthTex->UpdateResource();
+	}
 
 	SnowDepthRegion = FUpdateTextureRegion2D(0, 0, 0, 0, DepthResX, DepthResY);
 }
@@ -621,10 +710,21 @@ void ASnowSimulationActor::UpdateSnowDepthTexture()
 	}
 
 	const int32 W = DepthResX, H = DepthResY;
-	static TArray<uint16> Buf;
-	Buf.SetNumUninitialized(W * H);
+	const float rho_w = 1000.f; // kg/m^3
+	const float invRhoSnow = (SnowDensity > 1.f) ? (1.0f / SnowDensity) : (1.0f / 300.f);
 
-	const float rhoWater = 1000.f;
+	float MaxDepthMetersThisTick = 0.f;
+
+	if (!SnowDepthTex->GetPlatformData() || SnowDepthTex->GetPlatformData()->Mips.Num() == 0)
+	{
+		return;
+	}
+
+	FTexture2DMipMap& Mip = SnowDepthTex->GetPlatformData()->Mips[0];
+	uint8* Raw = static_cast<uint8*>(Mip.BulkData.Lock(LOCK_READ_WRITE));
+	FFloat16* Out = reinterpret_cast<FFloat16*>(Raw);
+	const int32 N = W * H;
+
 	for (int32 y = 0; y < H; ++y)
 	{
 		const float ty = (float)y / (H - 1);
@@ -634,21 +734,149 @@ void ASnowSimulationActor::UpdateSnowDepthTexture()
 			const int32 gx = FMath::Clamp(FMath::RoundToInt(tx * (GridX - 1)), 0, GridX - 1);
 			const int32 gy = FMath::Clamp(FMath::RoundToInt(ty * (GridY - 1)), 0, GridY - 1);
 
-			const float SWE_m = GetSWE_Clamped(gx, gy);
-			const float depth_m = SWE_m * (rhoWater / FMath::Max(1.f, SnowDensity));
+			const int32 i = y * W + x;
+			const float SWE_mwe = GetSWE_Clamped(gx, gy);
+			float depth_m = SWE_mwe * rho_w * invRhoSnow; // meters of snow
+			depth_m = FMath::Clamp(depth_m, 0.f, MaxClampMeters);
+			MaxDepthMetersThisTick = FMath::Max(MaxDepthMetersThisTick, depth_m);
 
-			Buf[y * W + x] = FFloat16(depth_m).Encoded;
+			if (bNormalizeDepthTexture)
+			{
+				const float norm = FMath::Clamp(depth_m / FMath::Max(DepthRangeMeters, 0.01f), 0.f, 1.f);
+				Out[i] = FFloat16(norm);
+			}
+			else
+			{
+				Out[i] = FFloat16(depth_m); // store meters directly
+			}
 		}
 	}
 
-	float maxDepth = 0.f;
-	for (int32 i=0; i < W*H; ++i) { maxDepth = FMath::Max(maxDepth, FFloat16(Buf[i]).GetFloat()); }
-	UE_LOG(LogTemp, Warning, TEXT("[Snow] DepthTex max=%.3fm (pre-scale)"), maxDepth);
+	Mip.BulkData.Unlock();
+	SnowDepthTex->UpdateResource();
 
-	const uint32 SrcPitch = W * sizeof(uint16);
-	const uint32 SrcBpp   = sizeof(uint16);
-	SnowDepthTex->UpdateTextureRegions(0, 1, &SnowDepthRegion, SrcPitch, SrcBpp,
-		reinterpret_cast<uint8*>(Buf.GetData()));
+	ensureAlwaysMsgf(MaxDepthMetersThisTick <= MaxClampMeters + 0.01f,
+		TEXT("[Snow] Depth sanity failed: %.3fm > MaxClampMeters=%.3fm. Check SWE->depth conversion."),
+		MaxDepthMetersThisTick, MaxClampMeters);
+
+	// Improved logging
+	if (bNormalizeDepthTexture)
+	{
+		const float normMax = FMath::Clamp(MaxDepthMetersThisTick / FMath::Max(DepthRangeMeters, 0.01f), 0.f, 1.f);
+		UE_LOG(LogTemp, Warning, TEXT("[Snow] DepthTex max=%.3fm (norm=%.3f of %.2fm range)"),
+			MaxDepthMetersThisTick, normMax, DepthRangeMeters);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Snow] DepthTex max=%.3fm (raw meters in R16F)"),
+			MaxDepthMetersThisTick);
+	}
+}
+
+void ASnowSimulationActor::WireSnowDepthToVHM()
+{
+	if (!SnowDepthTex) { UE_LOG(LogTemp, Error, TEXT("[Snow] Wire: DepthTex is null")); return; }
+
+	auto BindOne = [&](UVirtualHeightfieldMeshComponent* VHM)->int32
+	{
+		if (!VHM) return 0;
+		
+		// --- compute domain (unchanged) ---
+		float DomainSizeCm = WorldSizeX;
+		FVector2D OriginXY(GetActorLocation().X - DomainSizeCm*0.5f,
+			GetActorLocation().Y - DomainSizeCm*0.5f);
+		{
+			TArray<AActor*> Landscapes;
+			UGameplayStatics::GetAllActorsOfClass(GetWorld(), ALandscapeProxy::StaticClass(), Landscapes);
+			float Best = TNumericLimits<float>::Max(); ALandscapeProxy* LBest = nullptr;
+			for (AActor* LA : Landscapes)
+			{
+				const float D2 = FVector::DistSquared(LA->GetActorLocation(), GetActorLocation());
+				if (D2 < Best) { Best = D2; LBest = Cast<ALandscapeProxy>(LA); }
+			}
+			if (LBest)
+			{
+				FVector O, Ext; LBest->GetActorBounds(false, O, Ext);
+				DomainSizeCm = FMath::Max(Ext.X*2.f, Ext.Y*2.f);
+				OriginXY = FVector2D(O.X - Ext.X, O.Y - Ext.Y);
+			}
+		}
+
+		// ---- ensure slot 0 exists and has a base material ----
+		int32 NumSlots = VHM->GetNumMaterials();
+		UE_LOG(LogTemp, Warning, TEXT("[Snow] VHM %s: NumSlots=%d"), *VHM->GetName(), NumSlots);
+
+		UPrimitiveComponent* PrimComp = static_cast<UPrimitiveComponent*>(VHM);
+		UMaterialInterface* BaseMtl = (NumSlots > 0) ? PrimComp->GetMaterial(0) : nullptr;
+		if (!BaseMtl)
+		{
+			UMaterialInterface* Fallback = DefaultVHMMaterial.LoadSynchronous();
+			if (!Fallback)
+			{
+				UE_LOG(LogTemp, Error, TEXT("[Snow] VHM %s has no material; set DefaultVHMMaterial in SnowSimulationActor!"),
+					*VHM->GetName());
+				return 0;
+			}
+			PrimComp->SetMaterial(0, Fallback);
+			BaseMtl = PrimComp->GetMaterial(0);
+			UE_LOG(LogTemp, Warning, TEXT("[Snow] Set default material %s on %s"), *Fallback->GetName(), *VHM->GetName());
+		}
+
+		// ---- create MID and bind params ----
+		UMaterialInstanceDynamic* MID = Cast<UMaterialInstanceDynamic>(BaseMtl);
+		if (!MID)
+		{
+			MID = UMaterialInstanceDynamic::Create(BaseMtl, this);
+			PrimComp->SetMaterial(0, MID);
+			UE_LOG(LogTemp, Warning, TEXT("[Snow] Created MID on %s slot 0 from %s"), *VHM->GetName(), *BaseMtl->GetName());
+		}
+
+		MID->SetTextureParameterValue("SnowDepthTex", SnowDepthTex);
+		MID->SetScalarParameterValue("DepthRangeMeters", DepthRangeMeters);
+		MID->SetScalarParameterValue("DisplacementScale", DisplacementScale);
+		MID->SetVectorParameterValue("SnowOriginWS", FLinearColor(OriginXY.X, OriginXY.Y, 0, 0));
+		MID->SetScalarParameterValue("SnowInvSize", 1.0f / FMath::Max(DomainSizeCm, 1.f));
+
+		UTexture* Bound = nullptr;
+		MID->GetTextureParameterValue(FMaterialParameterInfo("SnowDepthTex"), Bound);
+		UE_LOG(LogTemp, Warning, TEXT("[Snow] Bound=%s Size=%.0fcm Origin=(%.0f,%.0f) InvSize=%.8f"),
+			Bound ? *Bound->GetName() : TEXT("NONE"),
+			DomainSizeCm, OriginXY.X, OriginXY.Y, 1.0f/FMath::Max(DomainSizeCm,1.f));
+
+		return 1;
+	};
+
+	// ----- Try the explicit actor first (with correct component enumeration)
+	int32 Total = 0;
+	if (TargetVHMActor.IsValid())
+	{
+		AActor* A = TargetVHMActor.Get();
+		UE_LOG(LogTemp, Warning, TEXT("[Snow] TargetVHMActor: %s (%s)"), *A->GetName(), *A->GetClass()->GetName());
+		// Correct API: collect VHM comps including child actors
+		TArray<UVirtualHeightfieldMeshComponent*> VHMOnActor;
+		A->GetComponents<UVirtualHeightfieldMeshComponent>(VHMOnActor, /*bIncludeFromChildActors*/ true);
+		UE_LOG(LogTemp, Warning, TEXT("[Snow]   VHM comps on actor (incl. children): %d"), VHMOnActor.Num());
+		for (auto* C : VHMOnActor) { Total += BindOne(C); }
+		if (Total > 0) { UE_LOG(LogTemp, Warning, TEXT("[Snow] Wired via TargetVHMActor (%d comps)"), Total); }
+	}
+
+	// ----- Global fallback if still zero
+	if (Total == 0)
+	{
+		for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+		{
+			TInlineComponentArray<UVirtualHeightfieldMeshComponent*> VHMOnActor(*It, /*bIncludeFromChildActors*/ true);
+			for (auto* C : VHMOnActor) { Total += BindOne(C); }
+		}
+		UE_LOG(LogTemp, Warning, TEXT("[Snow] Wired VHM comps (global): %d"), Total);
+	}
+
+	// ----- Retry once if still nothing (VHM may init after us)
+	if (Total == 0 && bRetryWireIfMissing)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Snow] No VHM wired; retrying in %.2fs"), WireRetryDelay);
+		FTimerHandle H; GetWorldTimerManager().SetTimer(H, this, &ASnowSimulationActor::WireSnowDepthToVHM, WireRetryDelay, false);
+	}
 }
 
 FVector2D ASnowSimulationActor::GridToLocalXY(int32 ix, int32 iy) const
@@ -677,6 +905,8 @@ float ASnowSimulationActor::GetSWE(int32 ix, int32 iy) const
 	return swe_mm * 0.001f; // meters water equivalent
 }
 
+// Legacy rebuild guarded by compile-time switch
+#if SNOW_WITH_LEGACY_PROCMESH
 void ASnowSimulationActor::RebuildSnowMesh()
 {
 	UE_LOG(LogTemp, Warning, TEXT("[Snow] RebuildSnowMesh() start Grid=%dx%d World=%.0fx%.0f cm"),
@@ -688,7 +918,7 @@ void ASnowSimulationActor::RebuildSnowMesh()
 		return;
 	}
 
-	if (!SnowMesh)
+	if (!LegacyProcMesh)
 	{
 		return;
 	}
@@ -707,7 +937,7 @@ void ASnowSimulationActor::RebuildSnowMesh()
 	if (!W) { UE_LOG(LogTemp, Error, TEXT("[Snow] World==nullptr")); return; }
 	FCollisionQueryParams Q(FName(TEXT("SnowBaseTrace")), /*bTraceComplex=*/false, this);
 	Q.AddIgnoredActor(this);
-	if (SnowMesh) { Q.AddIgnoredComponent(SnowMesh); }
+	if (LegacyProcMesh) { Q.AddIgnoredComponent(LegacyProcMesh); }
 	Q.bFindInitialOverlaps = false;
 	FCollisionObjectQueryParams Obj;
 	Obj.AddObjectTypesToQuery(ECC_WorldStatic);
@@ -778,22 +1008,22 @@ void ASnowSimulationActor::RebuildSnowMesh()
 		CornerWS(0,0); CornerWS(1,0); CornerWS(0,1); CornerWS(1,1);
 	}
 
-	SnowMesh->ClearAllMeshSections();
-	SnowMesh->CreateMeshSection_LinearColor(0, DynVerts, Indices, Normals, UVs, TArray<FLinearColor>(), Tangents, true);
+	LegacyProcMesh->ClearAllMeshSections();
+	LegacyProcMesh->CreateMeshSection_LinearColor(0, DynVerts, Indices, Normals, UVs, TArray<FLinearColor>(), Tangents, true);
 	{
 		UMaterialInterface* DefaultMat = UMaterial::GetDefaultMaterial(MD_Surface);
 		if (DefaultMat)
 		{
-			SnowMesh->SetMaterial(0, DefaultMat);
+			LegacyProcMesh->SetMaterial(0, DefaultMat);
 		}
-		SnowMesh->SetRelativeLocation(FVector::ZeroVector);
-		SnowMesh->SetRelativeRotation(FRotator::ZeroRotator);
-		SnowMesh->SetRelativeScale3D(FVector(1));
-		SnowMesh->MarkRenderStateDirty();
+		LegacyProcMesh->SetRelativeLocation(FVector::ZeroVector);
+		LegacyProcMesh->SetRelativeRotation(FRotator::ZeroRotator);
+		LegacyProcMesh->SetRelativeScale3D(FVector(1));
+		LegacyProcMesh->MarkRenderStateDirty();
 	}
-	SnowMesh->ContainsPhysicsTriMeshData(true);
+	LegacyProcMesh->ContainsPhysicsTriMeshData(true);
 
-	const FBoxSphereBounds B = SnowMesh->Bounds;
+	const FBoxSphereBounds B = LegacyProcMesh->Bounds;
 	UE_LOG(LogTemp, Warning, TEXT("[Snow] Rebuild done. Hit=%d  Verts=%d  Tris=%d  Bounds Origin=%s Extent=%s"),
 		hitCount, DynVerts.Num(), Indices.Num()/3, *B.Origin.ToString(), *B.BoxExtent.ToString());
 
@@ -802,31 +1032,41 @@ void ASnowSimulationActor::RebuildSnowMesh()
 
 	DrawDebugBox(W, B.Origin, B.BoxExtent, FColor::Yellow, false, 10.f, 0, 2.f);
 }
+#else
+void ASnowSimulationActor::RebuildSnowMesh(){}
+#endif
 
 
+#if SNOW_WITH_LEGACY_PROCMESH
 void ASnowSimulationActor::SnowMeshInfo()
 {
-	if (!SnowMesh)
+	if (!LegacyProcMesh)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[Snow] SnowMesh missing"));
+		UE_LOG(LogTemp, Warning, TEXT("[Snow] LegacyProcMesh missing"));
 		return;
 	}
-	const FBoxSphereBounds B = SnowMesh->Bounds;
+	const FBoxSphereBounds B = LegacyProcMesh->Bounds;
 	UE_LOG(LogTemp, Log, TEXT("[Snow] Sections:%d  Verts:%d  Bounds O:%s Ext:%s  WorldLoc:%s"),
-		SnowMesh->GetNumSections(), DynVerts.Num(),
+		LegacyProcMesh->GetNumSections(), DynVerts.Num(),
 		*B.Origin.ToString(), *B.BoxExtent.ToString(),
 		*GetActorLocation().ToString());
 
 	// Visualize bounds
 	DrawDebugBox(GetWorld(), B.Origin, B.BoxExtent, FColor::Cyan, false, 5.f, 0, 2.f);
 }
+#else
+void ASnowSimulationActor::SnowMeshInfo()
+{
+	// Legacy path disabled; no-op
+}
+#endif
 
 
 void ASnowSimulationActor::SnowMove(float X, float Y, float Z)
 {
 	SetActorLocation(FVector(X, Y, Z));
 	UE_LOG(LogTemp, Warning, TEXT("[Snow] SnowMove -> %s"), *GetActorLocation().ToString());
-	RebuildSnowMesh();
+	// Legacy procedural mesh removed
 }
 
 
@@ -836,7 +1076,7 @@ void ASnowSimulationActor::SnowSize(float SizeMeters)
 	WorldSizeX = S;
 	WorldSizeY = S;
 	UE_LOG(LogTemp, Warning, TEXT("[Snow] SnowSize set to %.0f cm"), S);
-	RebuildSnowMesh();
+	// Legacy procedural mesh removed
 }
 
 void ASnowSimulationActor::SnowHere(float SizeMeters)
