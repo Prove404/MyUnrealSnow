@@ -27,7 +27,35 @@
 #include "Math/Float16.h"
 #include "LandscapeProxy.h"
 #include "EngineUtils.h"
-#include "VirtualHeightfieldMeshComponent.h"
+#include "VT/RuntimeVirtualTexture.h"
+#include "Components/RuntimeVirtualTextureComponent.h"
+// Reflection helpers
+#include "UObject/UnrealType.h"
+
+// VHM header can be exposed under two paths; support both:
+#if __has_include("Components/VirtualHeightfieldMeshComponent.h")
+  #include "Components/VirtualHeightfieldMeshComponent.h"
+  #define HAS_VHM 1
+#elif __has_include("VirtualHeightfieldMeshComponent.h")
+  #include "VirtualHeightfieldMeshComponent.h"
+  #define HAS_VHM 1
+#else
+  #define HAS_VHM 0
+#endif
+#include "PixelFormat.h"
+
+// RVT Volume header can vary across engine versions; include conditionally
+#if __has_include("Engine/RuntimeVirtualTextureVolume.h")
+  #include "Engine/RuntimeVirtualTextureVolume.h"
+  #define HAS_RVT_VOLUME 1
+#elif __has_include("RuntimeVirtualTexture/RuntimeVirtualTextureVolume.h")
+  #include "RuntimeVirtualTexture/RuntimeVirtualTextureVolume.h"
+  #define HAS_RVT_VOLUME 1
+#else
+  #define HAS_RVT_VOLUME 0
+#endif
+
+// Material MID already included via Materials/MaterialInstanceDynamic.h at top
 
 #ifndef SNOW_WITH_LEGACY_PROCMESH
 #define SNOW_WITH_LEGACY_PROCMESH 0
@@ -85,6 +113,47 @@ static void LogSWEStats(const TArray<float>& SWE, int32 GX, int32 GY, float Snow
 
 	UE_LOG(LogTemp, Log, TEXT("[Snow] SWE mean=%.4f mwe, max=%.4f mwe -> maxDepth=%.3f m, disp=%.1f cm (scale=%.2f)"),
 		mean, maxSWE, maxDepth_m, maxDisp_cm, DisplacementScale);
+}
+FSnowUVParams ASnowSimulationActor::ComputeSnowUVParams() const
+{
+    FSnowUVParams P;
+    // Compute lower-left origin in world meters
+    const float DomainSizeCm = WorldSizeX;
+    FVector2D OriginXY(GetActorLocation().X - DomainSizeCm * 0.5f,
+        GetActorLocation().Y - DomainSizeCm * 0.5f);
+    // Prefer full union of all landscape proxies' bounds to cover entire landscape
+    {
+        FBox Bounds(ForceInit);
+        for (TActorIterator<ALandscapeProxy> It(GetWorld()); It; ++It)
+        {
+            ALandscapeProxy* Proxy = *It;
+            if (Proxy)
+            {
+                Bounds += Proxy->GetComponentsBoundingBox(true);
+            }
+        }
+        if (Bounds.IsValid)
+        {
+            const FVector Min = Bounds.Min;
+            const FVector Max = Bounds.Max;
+            const FVector2D Origin_m(Min.X / 100.f, Min.Y / 100.f);
+            const FVector2D Size_m((Max.X - Min.X) / 100.f, (Max.Y - Min.Y) / 100.f);
+            P.OriginMeters = Origin_m;
+            const float WidthMeters  = FMath::Max(Size_m.X, 1.f);
+            const float HeightMeters = FMath::Max(Size_m.Y, 1.f);
+            P.InvSizePerMeter = FVector2D(1.0f / WidthMeters, 1.0f / HeightMeters);
+        }
+        else
+        {
+            P.OriginMeters = OriginXY / 100.f;
+            const float WidthMeters = FMath::Max(WorldSizeX / 100.f, 1.f);
+            const float HeightMeters = FMath::Max(WorldSizeY / 100.f, 1.f);
+            P.InvSizePerMeter = FVector2D(1.0f / WidthMeters, 1.0f / HeightMeters);
+        }
+    }
+    P.DepthRangeMeters = DepthRangeMeters;
+    P.DisplacementScale = DisplacementScale;
+    return P;
 }
 
 // Helper to disable and hide a component safely (used for legacy procedural mesh cleanup)
@@ -182,7 +251,19 @@ void ASnowSimulationActor::BeginPlay()
 	// Initialize runtime depth texture and bind to writer
 	if (!SnowDepthTex) InitSnowDepthTexture();
 	UpdateSnowDepthTexture();
-	UE_LOG(LogTemp, Warning, TEXT("[Snow] DepthTex init: %dx%d"), DepthResX, DepthResY);
+	{
+		EPixelFormat PF = PF_Unknown;
+		if (SnowDepthTex && SnowDepthTex->GetPlatformData())
+		{
+			PF = (EPixelFormat)SnowDepthTex->GetPlatformData()->PixelFormat;
+		}
+		UE_LOG(LogTemp, Display, TEXT("[Snow] Tex %s PF=%d sRGB=%d Size=%dx%d"),
+			SnowDepthTex ? *SnowDepthTex->GetName() : TEXT("<null>"),
+			(int)PF,
+			SnowDepthTex ? (int)SnowDepthTex->SRGB : -1,
+			SnowDepthTex ? SnowDepthTex->GetSizeX() : 0,
+			SnowDepthTex ? SnowDepthTex->GetSizeY() : 0);
+	}
 	WireSnowDepthToVHM();
 	{
 		TArray<AActor*> TaggedActors;
@@ -202,28 +283,45 @@ void ASnowSimulationActor::BeginPlay()
 					{
 						// Bind the dynamic R16F depth texture
 						SnowWriterMID->SetTextureParameterValue(SnowDepthParam, SnowDepthTex);
-						// Verify texture parameter binding
+						// Prefer landscape XY bounds when available to define UV mapping in meters
+						auto GetLandscapeXYMeters = [this]() -> TOptional<TTuple<FVector2D, FVector2D>>
 						{
-							UTexture* BoundTex = nullptr;
-							const bool bGot = SnowWriterMID->GetTextureParameterValue(FName("SnowDepthTex"), BoundTex);
-							if (bGot && BoundTex == SnowDepthTex)
+							FBox Bounds(ForceInit);
+							for (TActorIterator<ALandscapeProxy> It(GetWorld()); It; ++It)
 							{
-								UE_LOG(LogTemp, Warning, TEXT("[Snow] Texture param successfully bound."));
+								ALandscapeProxy* P = *It;
+								Bounds += P->GetComponentsBoundingBox(true);
 							}
-							else
-							{
-								UE_LOG(LogTemp, Error, TEXT("[Snow] Texture param binding FAILED."));
-							}
+							if (!Bounds.IsValid) return {};
+
+							const FVector Min = Bounds.Min;
+							const FVector Max = Bounds.Max;
+
+							const FVector2D Origin_m(Min.X / 100.f, Min.Y / 100.f);
+							const FVector2D Size_m((Max.X - Min.X) / 100.f, (Max.Y - Min.Y) / 100.f);
+							return MakeTuple(Origin_m, Size_m);
+						};
+
+						if (auto Opt = GetLandscapeXYMeters())
+						{
+							const FVector2D Origin_m = Opt->Get<0>();
+							const FVector2D Size_m   = Opt->Get<1>();
+							const FVector2D InvSizePerMeter(1.f / FMath::Max(Size_m.X, KINDA_SMALL_NUMBER), 1.f / FMath::Max(Size_m.Y, KINDA_SMALL_NUMBER));
+
+							SnowWriterMID->SetVectorParameterValue("SnowOriginMeters", FLinearColor(Origin_m.X, Origin_m.Y, 0, 0));
+							SnowWriterMID->SetVectorParameterValue("SnowInvSizePerMeter", FLinearColor(InvSizePerMeter.X, InvSizePerMeter.Y, 0, 0));
+
+							UE_LOG(LogTemp, Display, TEXT("[Snow] Landscape XY: Origin=(%.1f,%.1f)m Size=(%.1f,%.1f)m"),
+								Origin_m.X, Origin_m.Y, Size_m.X, Size_m.Y);
 						}
-						// Optional: also push the scalar params so you don’t set them by hand
-						SnowWriterMID->SetScalarParameterValue(FName("DisplacementScale"), DisplacementScale);
-						SnowWriterMID->SetScalarParameterValue(FName("DepthRangeMeters"), DepthRangeMeters);
-						const float DomainSizeCm = WorldSizeX;
-						const FVector2D OriginXY(GetActorLocation().X - DomainSizeCm * 0.5f,
-							GetActorLocation().Y - DomainSizeCm * 0.5f);
-						SnowWriterMID->SetVectorParameterValue(FName("SnowOriginWS"),
-							FLinearColor(OriginXY.X, OriginXY.Y, 0, 0));
-						SnowWriterMID->SetScalarParameterValue(FName("SnowInvSize"), (DomainSizeCm != 0.f) ? (1.0f / DomainSizeCm) : 0.f);
+						else
+						{
+							UE_LOG(LogTemp, Warning, TEXT("[Snow] No Landscape bounds found; falling back to previous SnowSize."));
+						}
+
+						// Also push the scalar params
+						SnowWriterMID->SetScalarParameterValue("SnowDepthRangeMeters", DepthRangeMeters);
+						SnowWriterMID->SetScalarParameterValue("SnowDisplacementScale", DisplacementScale);
 					}
 				}
 			}
@@ -428,6 +526,42 @@ void ASnowSimulationActor::Tick(float DeltaSeconds)
 	if (SnowWriterMID && SnowDepthTex)
 	{
 		SnowWriterMID->SetTextureParameterValue(SnowDepthParam, SnowDepthTex);
+		// Use landscape bounds if present; otherwise fall back to previous mapping helper
+		auto GetLandscapeXYMeters = [this]() -> TOptional<TTuple<FVector2D, FVector2D>>
+		{
+			FBox Bounds(ForceInit);
+			for (TActorIterator<ALandscapeProxy> It(GetWorld()); It; ++It)
+			{
+				ALandscapeProxy* P = *It;
+				Bounds += P->GetComponentsBoundingBox(true);
+			}
+			if (!Bounds.IsValid) return {};
+
+			const FVector Min = Bounds.Min;
+			const FVector Max = Bounds.Max;
+
+			const FVector2D Origin_m(Min.X / 100.f, Min.Y / 100.f);
+			const FVector2D Size_m((Max.X - Min.X) / 100.f, (Max.Y - Min.Y) / 100.f);
+			return MakeTuple(Origin_m, Size_m);
+		};
+
+		if (auto Opt = GetLandscapeXYMeters())
+		{
+			const FVector2D Origin_m = Opt->Get<0>();
+			const FVector2D Size_m   = Opt->Get<1>();
+			const FVector2D InvSizePerMeter(1.f / FMath::Max(Size_m.X, KINDA_SMALL_NUMBER), 1.f / FMath::Max(Size_m.Y, KINDA_SMALL_NUMBER));
+
+			SnowWriterMID->SetVectorParameterValue("SnowOriginMeters", FLinearColor(Origin_m.X, Origin_m.Y, 0, 0));
+			SnowWriterMID->SetVectorParameterValue("SnowInvSizePerMeter", FLinearColor(InvSizePerMeter.X, InvSizePerMeter.Y, 0, 0));
+		}
+		else
+		{
+			const FSnowUVParams P = ComputeSnowUVParams();
+			SnowWriterMID->SetVectorParameterValue("SnowOriginMeters", FLinearColor(P.OriginMeters.X, P.OriginMeters.Y, 0, 0));
+			SnowWriterMID->SetVectorParameterValue("SnowInvSizePerMeter", FLinearColor(P.InvSizePerMeter.X, P.InvSizePerMeter.Y, 0, 0));
+		}
+		SnowWriterMID->SetScalarParameterValue("SnowDepthRangeMeters", DepthRangeMeters);
+		SnowWriterMID->SetScalarParameterValue("SnowDisplacementScale", DisplacementScale);
 	}
 
 	// --- TEMPORARY demo growth (disable by default) ---
@@ -680,11 +814,20 @@ void ASnowSimulationActor::SimulateStep(float DeltaSeconds)
 
 void ASnowSimulationActor::InitSnowDepthTexture()
 {
-	SnowDepthTex = UTexture2D::CreateTransient(DepthResX, DepthResY, PF_R16F);
-	SnowDepthTex->SRGB = false;
-	SnowDepthTex->CompressionSettings = TC_HDR;
-	SnowDepthTex->Filter = TF_Nearest;
-	SnowDepthTex->AddressX = TA_Clamp; SnowDepthTex->AddressY = TA_Clamp;
+	EPixelFormat ChosenPF = PF_R16F; // prefer bandwidth-efficient half-float
+	#if defined(PF_R16F) && defined(PF_R32_FLOAT)
+	if (!GPixelFormats[PF_R16F].Supported && GPixelFormats[PF_R32_FLOAT].Supported)
+	{
+		ChosenPF = PF_R32_FLOAT;
+	}
+	#endif
+
+	SnowDepthTex = UTexture2D::CreateTransient(DepthResX, DepthResY, ChosenPF);
+	SnowDepthTex->CompressionSettings = TC_HDR; // no color compression
+	SnowDepthTex->SRGB = false;                 // linear
+	SnowDepthTex->Filter = TF_Bilinear;         // smooth sampling
+	SnowDepthTex->AddressX = TA_Clamp;
+	SnowDepthTex->AddressY = TA_Clamp;
 	SnowDepthTex->UpdateResource();
 
 	// Zero-initialize first mip once after creation
@@ -722,7 +865,9 @@ void ASnowSimulationActor::UpdateSnowDepthTexture()
 
 	FTexture2DMipMap& Mip = SnowDepthTex->GetPlatformData()->Mips[0];
 	uint8* Raw = static_cast<uint8*>(Mip.BulkData.Lock(LOCK_READ_WRITE));
-	FFloat16* Out = reinterpret_cast<FFloat16*>(Raw);
+	const EPixelFormat PF = (EPixelFormat)SnowDepthTex->GetPlatformData()->PixelFormat;
+	FFloat16* Out16 = (PF == PF_R16F) ? reinterpret_cast<FFloat16*>(Raw) : nullptr;
+	float* Out32 = (PF == PF_R32_FLOAT) ? reinterpret_cast<float*>(Raw) : nullptr;
 	const int32 N = W * H;
 
 	for (int32 y = 0; y < H; ++y)
@@ -740,16 +885,24 @@ void ASnowSimulationActor::UpdateSnowDepthTexture()
 			depth_m = FMath::Clamp(depth_m, 0.f, MaxClampMeters);
 			MaxDepthMetersThisTick = FMath::Max(MaxDepthMetersThisTick, depth_m);
 
-			if (bNormalizeDepthTexture)
+			const float value = bNormalizeDepthTexture
+				? FMath::Clamp(depth_m / FMath::Max(DepthRangeMeters, 0.01f), 0.f, 1.f)
+				: depth_m;
+			if (Out16)
 			{
-				const float norm = FMath::Clamp(depth_m / FMath::Max(DepthRangeMeters, 0.01f), 0.f, 1.f);
-				Out[i] = FFloat16(norm);
+				Out16[i] = FFloat16(value);
 			}
-			else
+			else if (Out32)
 			{
-				Out[i] = FFloat16(depth_m); // store meters directly
+				Out32[i] = value;
 			}
 		}
+	}
+
+	// CPU debug scan before upload
+	if (MaxDepthMetersThisTick < 1e-6f)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Snow] SnowDepth buffer ~zero. Check forcing/redistributor mapping."));
 	}
 
 	Mip.BulkData.Unlock();
@@ -777,28 +930,41 @@ void ASnowSimulationActor::WireSnowDepthToVHM()
 {
 	if (!SnowDepthTex) { UE_LOG(LogTemp, Error, TEXT("[Snow] Wire: DepthTex is null")); return; }
 
+#if !HAS_VHM
+	UE_LOG(LogTemp, Error, TEXT("[Snow] VirtualHeightfieldMesh header not found. Enable the 'Virtual Heightfield Mesh' plugin and list it in UnrealSnow.uplugin + Build.cs."));
+	return;
+#endif
+
 	auto BindOne = [&](UVirtualHeightfieldMeshComponent* VHM)->int32
 	{
-		if (!VHM) return 0;
+		if (!VHM)
+		{
+			UE_LOG(LogTemp, Error, TEXT("[Snow] Wire: VHM component is null"));
+			return 0;
+		}
 		
-		// --- compute domain (unchanged) ---
+		// --- compute domain from union of all Landscape proxies ---
 		float DomainSizeCm = WorldSizeX;
 		FVector2D OriginXY(GetActorLocation().X - DomainSizeCm*0.5f,
 			GetActorLocation().Y - DomainSizeCm*0.5f);
 		{
-			TArray<AActor*> Landscapes;
-			UGameplayStatics::GetAllActorsOfClass(GetWorld(), ALandscapeProxy::StaticClass(), Landscapes);
-			float Best = TNumericLimits<float>::Max(); ALandscapeProxy* LBest = nullptr;
-			for (AActor* LA : Landscapes)
+			FBox Bounds(ForceInit);
+			for (TActorIterator<ALandscapeProxy> It(GetWorld()); It; ++It)
 			{
-				const float D2 = FVector::DistSquared(LA->GetActorLocation(), GetActorLocation());
-				if (D2 < Best) { Best = D2; LBest = Cast<ALandscapeProxy>(LA); }
+				ALandscapeProxy* Proxy = *It;
+				if (Proxy)
+				{
+					Bounds += Proxy->GetComponentsBoundingBox(true);
+				}
 			}
-			if (LBest)
+			if (Bounds.IsValid)
 			{
-				FVector O, Ext; LBest->GetActorBounds(false, O, Ext);
-				DomainSizeCm = FMath::Max(Ext.X*2.f, Ext.Y*2.f);
-				OriginXY = FVector2D(O.X - Ext.X, O.Y - Ext.Y);
+				const FVector Min = Bounds.Min;
+				const FVector Max = Bounds.Max;
+				OriginXY = FVector2D(Min.X, Min.Y);
+				const float WidthCm  = (Max.X - Min.X);
+				const float HeightCm = (Max.Y - Min.Y);
+				DomainSizeCm = FMath::Max(WidthCm, HeightCm);
 			}
 		}
 
@@ -821,6 +987,11 @@ void ASnowSimulationActor::WireSnowDepthToVHM()
 			BaseMtl = PrimComp->GetMaterial(0);
 			UE_LOG(LogTemp, Warning, TEXT("[Snow] Set default material %s on %s"), *Fallback->GetName(), *VHM->GetName());
 		}
+		if (!BaseMtl)
+		{
+			UE_LOG(LogTemp, Error, TEXT("[Snow] VHM %s has invalid material after fallback"), *VHM->GetName());
+			return 0;
+		}
 
 		// ---- create MID and bind params ----
 		UMaterialInstanceDynamic* MID = Cast<UMaterialInstanceDynamic>(BaseMtl);
@@ -837,11 +1008,104 @@ void ASnowSimulationActor::WireSnowDepthToVHM()
 		MID->SetVectorParameterValue("SnowOriginWS", FLinearColor(OriginXY.X, OriginXY.Y, 0, 0));
 		MID->SetScalarParameterValue("SnowInvSize", 1.0f / FMath::Max(DomainSizeCm, 1.f));
 
+		// One-time delayed reapply in case streaming proxies were not loaded yet
+		{
+			FTimerHandle ReapplyHandle;
+			GetWorld()->GetTimerManager().SetTimer(ReapplyHandle, [this, VHM]()
+			{
+				if (!IsValid(VHM)) return;
+				float DomainSizeCm2 = WorldSizeX;
+				FVector2D OriginXY2(GetActorLocation().X - DomainSizeCm2*0.5f,
+					GetActorLocation().Y - DomainSizeCm2*0.5f);
+				FBox Bounds2(ForceInit);
+				for (TActorIterator<ALandscapeProxy> It(GetWorld()); It; ++It)
+				{
+					ALandscapeProxy* Proxy = *It;
+					if (Proxy)
+					{
+						Bounds2 += Proxy->GetComponentsBoundingBox(true);
+					}
+				}
+				if (Bounds2.IsValid)
+				{
+					const FVector Min2 = Bounds2.Min;
+					const FVector Max2 = Bounds2.Max;
+					OriginXY2 = FVector2D(Min2.X, Min2.Y);
+					const float WidthCm2  = (Max2.X - Min2.X);
+					const float HeightCm2 = (Max2.Y - Min2.Y);
+					DomainSizeCm2 = FMath::Max(WidthCm2, HeightCm2);
+				}
+				UPrimitiveComponent* Prim2 = static_cast<UPrimitiveComponent*>(VHM);
+				if (Prim2)
+				{
+					UMaterialInterface* M = Prim2->GetMaterial(0);
+					if (UMaterialInstanceDynamic* MID2 = Cast<UMaterialInstanceDynamic>(M))
+					{
+						MID2->SetVectorParameterValue("SnowOriginWS", FLinearColor(OriginXY2.X, OriginXY2.Y, 0, 0));
+						MID2->SetScalarParameterValue("SnowInvSize", 1.0f / FMath::Max(DomainSizeCm2, 1.f));
+						UE_LOG(LogTemp, Display, TEXT("[Snow] Reapplied VHM mapping: OriginWS=(%.1f,%.1f)cm InvSize=%.9f /cm (Domain=%.1f cm)"),
+							OriginXY2.X, OriginXY2.Y, 1.0f / FMath::Max(DomainSizeCm2, 1.f), DomainSizeCm2);
+					}
+				}
+			}, 0.75f, false);
+		}
+
+		// Verify/assign VHM RVT binding without relying on protected members
+		{
+			#if HAS_RVT_VOLUME
+			auto FindAnyRVTVolume = [this]() -> ARuntimeVirtualTextureVolume*
+			{
+				for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+				{
+					if (ARuntimeVirtualTextureVolume* Vol = Cast<ARuntimeVirtualTextureVolume>(*It))
+					{
+						return Vol;
+					}
+				}
+				return nullptr;
+			};
+
+			auto SetVHMVirtualTextureVolume = [](UVirtualHeightfieldMeshComponent* InVHM, ARuntimeVirtualTextureVolume* Volume)->bool
+			{
+				if (!InVHM || !Volume) return false;
+				FProperty* BaseProp = UVirtualHeightfieldMeshComponent::StaticClass()->FindPropertyByName(TEXT("VirtualTexture"));
+				FSoftObjectProperty* SoftProp = CastField<FSoftObjectProperty>(BaseProp);
+				if (!SoftProp) return false;
+				void* ValuePtr = SoftProp->ContainerPtrToValuePtr<void>(InVHM);
+				SoftProp->SetObjectPropertyValue(ValuePtr, static_cast<UObject*>(Volume));
+				InVHM->MarkRenderStateDirty();
+				return true;
+			};
+
+			ARuntimeVirtualTextureVolume* Volume = FindAnyRVTVolume();
+			if (!Volume)
+			{
+				UE_LOG(LogTemp, Error, TEXT("[Snow] No RVT Volume found in world. Place an RVT Volume and assign your RVT asset."));
+			}
+			else if (!SetVHMVirtualTextureVolume(VHM, Volume))
+			{
+				UE_LOG(LogTemp, Error, TEXT("[Snow] Failed to set VHM.VirtualTexture via reflection."));
+			}
+			else
+			{
+				UE_LOG(LogTemp, Display, TEXT("[Snow] Bound VHM to RVT Volume %s"), *GetNameSafe(static_cast<const UObject*>(Volume)));
+			}
+			#else
+			UE_LOG(LogTemp, Warning, TEXT("[Snow] RVT Volume header not found; skipping VHM->RVT binding."));
+			#endif
+		}
+
 		UTexture* Bound = nullptr;
 		MID->GetTextureParameterValue(FMaterialParameterInfo("SnowDepthTex"), Bound);
-		UE_LOG(LogTemp, Warning, TEXT("[Snow] Bound=%s Size=%.0fcm Origin=(%.0f,%.0f) InvSize=%.8f"),
-			Bound ? *Bound->GetName() : TEXT("NONE"),
-			DomainSizeCm, OriginXY.X, OriginXY.Y, 1.0f/FMath::Max(DomainSizeCm,1.f));
+		static bool bLoggedOnce = false;
+		if (!bLoggedOnce)
+		{
+			const FSnowUVParams P = ComputeSnowUVParams();
+			UE_LOG(LogTemp, Display, TEXT("[Snow] Bound=%s Origin=(%.3f,%.3f)m InvSize=(%.6f,%.6f)/m Range=%.2fm Scale=%.2f"),
+				Bound ? *Bound->GetName() : TEXT("NONE"),
+				P.OriginMeters.X, P.OriginMeters.Y, P.InvSizePerMeter.X, P.InvSizePerMeter.Y, P.DepthRangeMeters, P.DisplacementScale);
+			bLoggedOnce = true;
+		}
 
 		return 1;
 	};
@@ -869,6 +1133,24 @@ void ASnowSimulationActor::WireSnowDepthToVHM()
 			for (auto* C : VHMOnActor) { Total += BindOne(C); }
 		}
 		UE_LOG(LogTemp, Warning, TEXT("[Snow] Wired VHM comps (global): %d"), Total);
+	}
+
+	// Diagnostics: log which landscapes write to an RVT
+	{
+		for (TActorIterator<ALandscapeProxy> It(GetWorld()); It; ++It)
+		{
+			ALandscapeProxy* Proxy = *It;
+			bool bWrites = false;
+			if (Proxy)
+			{
+				for (const TObjectPtr<URuntimeVirtualTexture>& VT : Proxy->RuntimeVirtualTextures)
+				{
+					if (VT != nullptr) { bWrites = true; break; }
+				}
+			}
+			UE_LOG(LogTemp, Display, TEXT("[Snow] Proxy %s writes to RVT: %s"),
+				*GetNameSafe(Proxy), bWrites ? TEXT("YES") : TEXT("NO"));
+		}
 	}
 
 	// ----- Retry once if still nothing (VHM may init after us)

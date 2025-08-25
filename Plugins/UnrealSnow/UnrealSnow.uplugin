@@ -18,6 +18,9 @@
       "Type": "Runtime",
       "LoadingPhase": "Default"
     }
+  ],
+  "Plugins": [
+    { "Name": "VirtualHeightfieldMesh", "Enabled": true }
   ]
 }
 

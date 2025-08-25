@@ -6,14 +6,16 @@ public class UnrealSnow : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
+
 		PublicDependencyModuleNames.AddRange(new string[]
 		{
-			"Core", "CoreUObject", "Engine", "InputCore", "RenderCore", "RHI", "Projects", "DeveloperSettings", "ProceduralMeshComponent"
+			"Core", "CoreUObject", "Engine", "InputCore", "Landscape", "DeveloperSettings"
 		});
+
 
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
-			"Slate", "SlateCore", "Renderer", "Landscape", "VirtualHeightfieldMesh", "Engine", "UMG"
+			"Projects", "RenderCore", "RHI", "VirtualHeightfieldMesh"
 		});
 
 		PublicIncludePaths.AddRange(new[] {

@@ -12,7 +12,6 @@ class UMaterialInstanceDynamic;
 class UVirtualHeightfieldMeshComponent;
 class USceneComponent;
 #pragma endregion
-#include "ProceduralMeshComponent.h"
 #include "Kismet/GameplayStatics.h"
 #include "Components/PrimitiveComponent.h"
 #include "Materials/MaterialInstanceDynamic.h"
@@ -20,6 +19,18 @@ class USceneComponent;
 #define SNOW_WITH_LEGACY_PROCMESH 0
 #endif
 #include "SnowSimulationActor.generated.h"
+
+class URuntimeVirtualTexture; // forward decl to avoid heavy include
+
+// World (cm) to snow-UV (0..1), given OriginMeters (x,y) and InvSizePerMeter (x,y).
+// We'll pass OriginMeters and InvSizePerMeter as material params and compute UV in material.
+struct FSnowUVParams
+{
+    FVector2D OriginMeters;     // lower-left world origin of the snow grid (meters, UE world /100)
+    FVector2D InvSizePerMeter;  // (1/WidthMeters, 1/HeightMeters)
+    float DepthRangeMeters;     // optional clamp/visualization
+    float DisplacementScale;    // extra gain on top of 100 cm/m
+};
 
 UCLASS()
 class UNREALSNOW_API ASnowSimulationActor : public AActor
@@ -152,6 +163,10 @@ protected:
 	UPROPERTY(EditAnywhere, Category="Snow|Viz")
 	FName SnowDepthScaleParam = TEXT("SnowDepthToWorld");
 
+	// Optional default RVT to bind to VHM if none is set in the scene
+	UPROPERTY(EditAnywhere, Category="Snow|RVT")
+	TSoftObjectPtr<URuntimeVirtualTexture> DefaultSnowRVT;
+
 	UPROPERTY(EditAnywhere, Category="Snow|Viz")
 	int32 DepthResX = 512;
 
@@ -188,16 +203,19 @@ protected:
 	TArray<float> SWE_Grid;
 	TArray<float> SWE_Temp;
 
+
+#if SNOW_WITH_LEGACY_PROCMESH
 	// ===== Procedural snow mesh buffers =====
-	UPROPERTY() TArray<FVector> BaseVerts;     // Base terrain vertices (sampled once)
-	UPROPERTY() TArray<FVector> DynVerts;      // Deformed vertices (Base + snow depth)
-	UPROPERTY() TArray<FVector> Normals;
-	UPROPERTY() TArray<FVector2D> UVs;
-	UPROPERTY() TArray<FProcMeshTangent> Tangents;
-	UPROPERTY() TArray<int32> Indices;
+	TArray<FVector> BaseVerts;     // Base terrain vertices (sampled once)
+	TArray<FVector> DynVerts;      // Deformed vertices (Base + snow depth)
+	TArray<FVector> Normals;
+	TArray<FVector2D> UVs;
+	TArray<FProcMeshTangent> Tangents;
+	TArray<int32> Indices;
 
 	// Utility
 	int32 VertIndex(int32 ix, int32 iy) const { return iy*(GridX+1) + ix; }
+#endif
 	FVector2D GridToLocalXY(int32 ix, int32 iy) const;
 
 public:
@@ -247,6 +265,9 @@ public:
 	void UpdateSnowDepthTexture();
 	void WireSnowDepthToVHM();
 
+	// Helper to compute material-space UV parameters based on actor/world state
+	FSnowUVParams ComputeSnowUVParams() const;
+
 // Legacy procedural mesh API (deprecated)
 UFUNCTION(BlueprintCallable, Category="Legacy", meta=(DeprecatedFunction, DeprecationMessage="Procedural mesh path removed; use RVT+VHM."))
 void RebuildSnowMesh();
@@ -260,8 +281,10 @@ void UpdateProceduralMesh();
 
 // (Stubs implemented in cpp when legacy is disabled.)
 
+#if SNOW_WITH_LEGACY_PROCMESH
 	// Safety: ensure mesh buffers are ready before updating
 	bool HasValidMeshBuffers() const { return DynVerts.Num() == (GridX+1)*(GridY+1); }
+#endif
 
 	// Console exec for quick mesh/bounds debug
 	UFUNCTION(Exec)
