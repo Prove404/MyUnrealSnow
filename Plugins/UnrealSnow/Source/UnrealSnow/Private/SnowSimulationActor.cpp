@@ -118,9 +118,12 @@ FSnowUVParams ASnowSimulationActor::ComputeSnowUVParams() const
 {
     FSnowUVParams P;
     // Compute lower-left origin in world meters
-    const float DomainSizeCm = WorldSizeX;
-    FVector2D OriginXY(GetActorLocation().X - DomainSizeCm * 0.5f,
-        GetActorLocation().Y - DomainSizeCm * 0.5f);
+    // Respect potentially non-square domains by using separate X/Y extents
+    const float DomainSizeXCm = WorldSizeX;
+    const float DomainSizeYCm = WorldSizeY;
+    FVector2D OriginXY(
+        GetActorLocation().X - DomainSizeXCm * 0.5f,
+        GetActorLocation().Y - DomainSizeYCm * 0.5f);
     // Prefer full union of all landscape proxies' bounds to cover entire landscape
     {
         FBox Bounds(ForceInit);
