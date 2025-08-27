@@ -208,10 +208,14 @@ protected:
 	UMaterialInstanceDynamic* SnowWriterMID = nullptr;
 
 	// VHM material binding convenience (user-specified material instance on VHM)
-	UPROPERTY()
-	UMaterialInstanceDynamic* SnowMID = nullptr;
-	UPROPERTY()
-	AActor* BoundVHMActor = nullptr;
+        UPROPERTY()
+        UMaterialInstanceDynamic* SnowMID = nullptr;
+        UPROPERTY()
+        AActor* BoundVHMActor = nullptr;
+
+        // Cached MIDs for all bound VHMs to push updated textures each step
+        UPROPERTY()
+        TArray<TWeakObjectPtr<UMaterialInstanceDynamic>> BoundVHMMIDs;
 
 	// --- Procedural snow surface mesh ---
 // No UPROPERTY for legacy procedural mesh; keep a private raw pointer below
