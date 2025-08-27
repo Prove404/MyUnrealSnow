@@ -9,19 +9,27 @@ public class UnrealSnow : ModuleRules
 
 		PublicDependencyModuleNames.AddRange(new string[]
 		{
-			"Core", "CoreUObject", "Engine", "InputCore", "Landscape", "DeveloperSettings"
+			"Core",
+			"CoreUObject",
+			"Engine",
+			"RenderCore",
+			"RHI",
+			"Projects",
+			"VirtualHeightfieldMesh",   // AVirtualHeightfieldMesh + UVirtualHeightfieldMeshComponent
+			"Landscape",
+			"DeveloperSettings"
 		});
 
 
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
-			"Projects", "RenderCore", "RHI", "VirtualHeightfieldMesh"
 		});
 
 		PublicIncludePaths.AddRange(new[] {
 			System.IO.Path.Combine(ModuleDirectory, "Public"),
 			System.IO.Path.Combine(ModuleDirectory, "Public/Simulation"),
-			System.IO.Path.Combine(ModuleDirectory, "Public/Weather")
+			System.IO.Path.Combine(ModuleDirectory, "Public/Weather"),
+			System.IO.Path.Combine(ModuleDirectory, "Public/Redistribution")
 		});
 
 		if (Target.bBuildEditor)

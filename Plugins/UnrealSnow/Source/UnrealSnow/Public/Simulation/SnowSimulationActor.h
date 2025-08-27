@@ -20,6 +20,12 @@ class USceneComponent;
 #endif
 #include "SnowSimulationActor.generated.h"
 
+UENUM(BlueprintType)
+enum class ERedistributionMode : uint8 { None, WindSlopeCPU /*, WindSlopeCS later*/ };
+
+UENUM(BlueprintType)
+enum class ESnowfallDebugMode : uint8 { Uniform, Checkerboard, RadialGradient, Noise };
+
 class URuntimeVirtualTexture; // forward decl to avoid heavy include
 
 // World (cm) to snow-UV (0..1), given OriginMeters (x,y) and InvSizePerMeter (x,y).
@@ -106,7 +112,17 @@ protected:
 
 	// Redistributor used to apply wind-driven transport effects.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="UnrealSnow|Redistribution")
-	UObject* Redistributor = nullptr;
+	UObject* Redistributor = nullptr; // legacy UObject redistributor (if any)
+
+	// New CPU redistributor mode and parameters
+	UPROPERTY(EditAnywhere, Category="Snow|Redistribution") ERedistributionMode Redistribution = ERedistributionMode::WindSlopeCPU;
+	UPROPERTY(EditAnywhere, Category="Snow|Redistribution") int32 IterationsPerTick = 2;
+	UPROPERTY(EditAnywhere, Category="Snow|Redistribution") float AngleOfReposeDeg = 37.f;
+	UPROPERTY(EditAnywhere, Category="Snow|Redistribution") float Diffusivity = 0.05f;
+	UPROPERTY(EditAnywhere, Category="Snow|Redistribution") float CapacityK = 0.005f;
+	UPROPERTY(EditAnywhere, Category="Snow|Redistribution") float CapacityP = 2.0f;
+	UPROPERTY(EditAnywhere, Category="Snow|Redistribution") float UstarThresh = 6.0f;
+	UPROPERTY(EditAnywhere, Category="Snow|Redistribution") float MaxErodeDepositRate = 0.02f;
 
 	// Output snow depth as a render target for visualization.
 	UPROPERTY(VisibleAnywhere, Category="UnrealSnow|Outputs")
@@ -158,7 +174,9 @@ protected:
 	FName SnowWriterActorTag = "SnowRVTWriter"; // actor in level with this tag
 
 	UPROPERTY(EditAnywhere, Category="Snow|Viz")
-	FName SnowDepthParam = TEXT("SnowDepthTex"); // material parameter name
+	FName SnowDepthParam = TEXT("SnowDepthSample"); // material parameter name
+	UPROPERTY(EditAnywhere, Category="Snow|Viz")
+	FName SnowDepthPrevParam = TEXT("SnowDepthPrevSample");
 
 	UPROPERTY(EditAnywhere, Category="Snow|Viz")
 	FName SnowDepthScaleParam = TEXT("SnowDepthToWorld");
@@ -176,12 +194,24 @@ protected:
 	UPROPERTY(Transient)
 	UTexture2D* SnowDepthTex = nullptr; // R16F meters
 
+	// Double-buffered snow depth textures for temporal effects
+	UPROPERTY(Transient)
+	UTexture2D* SnowDepthCurrent = nullptr;
+	UPROPERTY(Transient)
+	UTexture2D* SnowDepthPrev = nullptr;
+
 	TArray<float> SnowDepthData;
 	FUpdateTextureRegion2D SnowDepthRegion;
 
 	// Writer MID cache
 	UPROPERTY(Transient)
 	UMaterialInstanceDynamic* SnowWriterMID = nullptr;
+
+	// VHM material binding convenience (user-specified material instance on VHM)
+	UPROPERTY()
+	UMaterialInstanceDynamic* SnowMID = nullptr;
+	UPROPERTY()
+	AActor* BoundVHMActor = nullptr;
 
 	// --- Procedural snow surface mesh ---
 // No UPROPERTY for legacy procedural mesh; keep a private raw pointer below
@@ -264,6 +294,12 @@ public:
 	void InitSnowDepthTexture();
 	void UpdateSnowDepthTexture();
 	void WireSnowDepthToVHM();
+	void BindVHM_Material();
+	void SetSnowUVParamsFromLandscape();
+
+    // Debug helper: binds a generated checker/gradient texture to the depth param
+    UFUNCTION(CallInEditor, Category="Snow|Debug")
+    void DebugBindDepthTexture();
 
 	// Helper to compute material-space UV parameters based on actor/world state
 	FSnowUVParams ComputeSnowUVParams() const;
@@ -294,7 +330,7 @@ void UpdateProceduralMesh();
 	UFUNCTION(Exec)
 	void SnowMove(float X, float Y, float Z);           // set actor world location (cm)
 	UFUNCTION(Exec)
-	void SnowHere(float SizeMeters=500.0f); // move actor under camera & set size
+	void SnowHere(float SizeMeters=2016.0f); // move actor under camera & set size
 	UFUNCTION(Exec)
 	void SnowSize(float SizeMeters);        // just resize patch
 	UFUNCTION(Exec)
@@ -323,6 +359,21 @@ private:
 	TArray<float> SWE;         // mm
 	TArray<float> Depth01;     // normalized [0..1] for debug draw
 
+	// CPU redistribution working storage
+	TArray<float> GroundH_M;   // placeholder flat terrain until sampling is wired
+
+	// Optional one-off dump of redistributed depth to an R16F render target for QA
+	UPROPERTY(EditAnywhere, Category="Snow|Redistribution")
+	bool bDumpRedistributionOnce = false;
+	UPROPERTY(VisibleAnywhere, Category="Snow|Redistribution")
+	UTextureRenderTarget2D* RedistribDebugRT = nullptr;
+
+	// Snowfall spatial pattern controls (for debugging/testing)
+	UPROPERTY(EditAnywhere, Category="Snow|Precip") ESnowfallDebugMode SnowfallMode = ESnowfallDebugMode::Uniform;
+	UPROPERTY(EditAnywhere, Category="Snow|Precip", meta=(ClampMin="1", UIMin="2", UIMax="128")) int32 SnowfallCheckerSize = 32;
+	UPROPERTY(EditAnywhere, Category="Snow|Precip", meta=(ClampMin="0.0001", UIMin="0.001", UIMax="1.0")) float SnowfallNoiseScale = 0.05f;
+	UPROPERTY(EditAnywhere, Category="Snow|Precip", meta=(ClampMin="0.0", UIMin="0.0", UIMax="5.0")) float SnowfallNoiseIntensity = 1.0f;
+
 	UPROPERTY(VisibleAnywhere, Category="UnrealSnow|Debug")
 	float DebugMeanSWE = 0.f;
 
@@ -339,6 +390,8 @@ private:
 	// SWE helpers
 	void EnsureSWEStorage();
 	void SmoothSWE();
+	void DumpRedistributionRT(const TArray<float>& Depth_m, int32 W, int32 H);
+	void AfterRedistribution();
 
 	// Optional non-UPROPERTY pointer to any legacy procedural mesh component
 #if SNOW_WITH_LEGACY_PROCMESH
