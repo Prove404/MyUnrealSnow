@@ -23,9 +23,6 @@ class USceneComponent;
 UENUM(BlueprintType)
 enum class ERedistributionMode : uint8 { None, WindSlopeCPU /*, WindSlopeCS later*/ };
 
-UENUM(BlueprintType)
-enum class ESnowfallDebugMode : uint8 { Uniform, Checkerboard, RadialGradient, Noise };
-
 class URuntimeVirtualTexture; // forward decl to avoid heavy include
 
 // World (cm) to snow-UV (0..1), given OriginMeters (x,y) and InvSizePerMeter (x,y).
@@ -66,29 +63,18 @@ protected:
 	UPROPERTY(EditAnywhere, Category="UnrealSnow|Time")
 	FDateTime StartTime = FDateTime(2024,1,1,0,0,0);
 
-	// Debug snowfall override
-	UPROPERTY(EditAnywhere, Category="UnrealSnow|Debug")
-	bool bForceConstantSnow = true;
-
-	UPROPERTY(EditAnywhere, Category="UnrealSnow|Debug", meta=(EditCondition="bForceConstantSnow"))
-	float DebugSnow_mmph = 1.0f; // 1 mm/hour
-
-	// Debug visualization material
-	UPROPERTY(EditAnywhere, Category="UnrealSnow|Debug")
-	UMaterialInterface* DebugMaterial = nullptr;
+        // Debug visualization material
+        UPROPERTY(EditAnywhere, Category="UnrealSnow|Debug")
+        UMaterialInterface* DebugMaterial = nullptr;
 
 	UPROPERTY(Transient)
 	UMaterialInstanceDynamic* DebugMID = nullptr;
 
-	UPROPERTY(EditAnywhere, Category="UnrealSnow|Debug")
-	FName DebugTextureParam = "SnowDepthTex";
+        UPROPERTY(EditAnywhere, Category="UnrealSnow|Debug")
+        FName DebugTextureParam = "SnowDepthTex";
 
-	UPROPERTY(VisibleAnywhere, Category="UnrealSnow|Debug")
-	UStaticMeshComponent* DebugPlane = nullptr;
-
-	// Debug helpers
-	UPROPERTY(EditAnywhere, Category="Snow|Debug")
-	float DebugDisplacementBoost = 1.f;
+        UPROPERTY(VisibleAnywhere, Category="UnrealSnow|Debug")
+        UStaticMeshComponent* DebugPlane = nullptr;
 
 	// Ensure we have a root scene component
 	UPROPERTY(VisibleDefaultsOnly, Category="Snow")
@@ -98,11 +84,7 @@ protected:
 	UPROPERTY(EditAnywhere, Category="Legacy", AdvancedDisplay, meta=(DeprecatedProperty, DeprecationMessage="Procedural mesh path removed; use RVT+VHM."))
 	bool bEnableLegacyProceduralMesh = false;
 
-	// Optionally hide any legacy snow plane mesh if attached to this actor
-	UPROPERTY(EditAnywhere, Category="Snow|Debug")
-	bool bHideLegacySnowPlane = true;
-
-	// Pick a Blueprint class for the provider in the Details panel (no inline expansion).
+        // Pick a Blueprint class for the provider in the Details panel (no inline expansion).
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="UnrealSnow|Weather")
 	TSoftClassPtr<UStochasticWeatherProvider> WeatherProviderClass;
 
@@ -110,12 +92,8 @@ protected:
 	UPROPERTY(Transient)
 	UStochasticWeatherProvider* WeatherProvider = nullptr;
 
-	// Redistributor used to apply wind-driven transport effects.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="UnrealSnow|Redistribution")
-	UObject* Redistributor = nullptr; // legacy UObject redistributor (if any)
-
-	// New CPU redistributor mode and parameters
-	UPROPERTY(EditAnywhere, Category="Snow|Redistribution") ERedistributionMode Redistribution = ERedistributionMode::WindSlopeCPU;
+        // New CPU redistributor mode and parameters
+        UPROPERTY(EditAnywhere, Category="Snow|Redistribution") ERedistributionMode Redistribution = ERedistributionMode::WindSlopeCPU;
 	UPROPERTY(EditAnywhere, Category="Snow|Redistribution") int32 IterationsPerTick = 2;
 	UPROPERTY(EditAnywhere, Category="Snow|Redistribution") float AngleOfReposeDeg = 37.f;
 	UPROPERTY(EditAnywhere, Category="Snow|Redistribution") float Diffusivity = 0.05f;
@@ -322,25 +300,7 @@ void UpdateProceduralMesh();
 	bool HasValidMeshBuffers() const { return DynVerts.Num() == (GridX+1)*(GridY+1); }
 #endif
 
-	// Console exec for quick mesh/bounds debug
-	UFUNCTION(Exec)
-	void SnowMeshInfo();
-
-	// Console exec helpers
-	UFUNCTION(Exec)
-	void SnowMove(float X, float Y, float Z);           // set actor world location (cm)
-	UFUNCTION(Exec)
-	void SnowHere(float SizeMeters=2016.0f); // move actor under camera & set size
-	UFUNCTION(Exec)
-	void SnowSize(float SizeMeters);        // just resize patch
-	UFUNCTION(Exec)
-	void SnowLogCenter();                   // print sample trace info
-
-	// Debug options
-	UPROPERTY(EditAnywhere, Category="Snow|Debug")
-	bool bAutoSnapAtBeginPlay = true; // snap once at PIE
-
-	// SWE grid external setter and clamped getter
+        // SWE grid external setter and clamped getter
 	UFUNCTION(BlueprintCallable, Category="Snow|SWE")
 	void SetSWEAt(int32 X, int32 Y, float SWE_m);
 	float GetSWE_Clamped(int32 ix, int32 iy) const;
@@ -362,24 +322,9 @@ private:
 	// CPU redistribution working storage
 	TArray<float> GroundH_M;   // placeholder flat terrain until sampling is wired
 
-	// Optional one-off dump of redistributed depth to an R16F render target for QA
-	UPROPERTY(EditAnywhere, Category="Snow|Redistribution")
-	bool bDumpRedistributionOnce = false;
-	UPROPERTY(VisibleAnywhere, Category="Snow|Redistribution")
-	UTextureRenderTarget2D* RedistribDebugRT = nullptr;
-
-	// Snowfall spatial pattern controls (for debugging/testing)
-	UPROPERTY(EditAnywhere, Category="Snow|Precip") ESnowfallDebugMode SnowfallMode = ESnowfallDebugMode::Uniform;
-	UPROPERTY(EditAnywhere, Category="Snow|Precip", meta=(ClampMin="1", UIMin="2", UIMax="128")) int32 SnowfallCheckerSize = 32;
-	UPROPERTY(EditAnywhere, Category="Snow|Precip", meta=(ClampMin="0.0001", UIMin="0.001", UIMax="1.0")) float SnowfallNoiseScale = 0.05f;
-	UPROPERTY(EditAnywhere, Category="Snow|Precip", meta=(ClampMin="0.0", UIMin="0.0", UIMax="5.0")) float SnowfallNoiseIntensity = 1.0f;
-
-	UPROPERTY(VisibleAnywhere, Category="UnrealSnow|Debug")
-	float DebugMeanSWE = 0.f;
-
-	UPROPERTY(VisibleAnywhere, Category="UnrealSnow|Time")
-	FDateTime CurrentSimTime;
-	int32 StepIndex = 0;
+        UPROPERTY(VisibleAnywhere, Category="UnrealSnow|Time")
+        FDateTime CurrentSimTime;
+        int32 StepIndex = 0;
 	float LastMeanSWE = 0.0f;
 	float LastMeanSWRout = 0.0f;
 
@@ -390,8 +335,7 @@ private:
 	// SWE helpers
 	void EnsureSWEStorage();
 	void SmoothSWE();
-	void DumpRedistributionRT(const TArray<float>& Depth_m, int32 W, int32 H);
-	void AfterRedistribution();
+        void AfterRedistribution();
 
 	// Optional non-UPROPERTY pointer to any legacy procedural mesh component
 #if SNOW_WITH_LEGACY_PROCMESH

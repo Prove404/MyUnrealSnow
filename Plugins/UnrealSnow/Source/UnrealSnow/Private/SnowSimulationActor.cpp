@@ -10,10 +10,7 @@
 #include "Components/PrimitiveComponent.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialInterface.h"
-#include "DrawDebugHelpers.h"
 #include "Engine/CollisionProfile.h"
-#include "Simulation/ISnowRedistributor.h"
-#include "Simulation/RidgeLeewardRedistributor.h"
 #include "Redistribution/WindSlopeRedistributor.h"
 #include "Kismet/GameplayStatics.h"
 #include "Components/MeshComponent.h"
@@ -147,30 +144,7 @@ namespace
 }
 
 // Diagnostics helper to introspect actor components and child VHMs
-static void DumpActorComponents(AActor* A, const TCHAR* Tag)
-{
-    if (!A) { UE_LOG(LogTemp, Warning, TEXT("[Snow] %s: <null actor>"), Tag); return; }
-    UE_LOG(LogTemp, Warning, TEXT("[Snow] %s: Actor=%s Class=%s"), Tag, *A->GetName(), *A->GetClass()->GetName());
-    TArray<UActorComponent*> Cs; A->GetComponents(Cs);
-    UE_LOG(LogTemp, Warning, TEXT("[Snow]   Direct components: %d"), Cs.Num());
-    for (UActorComponent* C : Cs) { if (C) UE_LOG(LogTemp, Warning, TEXT("      - %s"), *C->GetClass()->GetName()); }
-    TInlineComponentArray<UVirtualHeightfieldMeshComponent*> VHMs(A, /*bIncludeFromChildActors*/ true);
-    UE_LOG(LogTemp, Warning, TEXT("[Snow]   Found VHM comps (incl. children): %d"), VHMs.Num());
-    for (auto* V : VHMs) { if (V) UE_LOG(LogTemp, Warning, TEXT("      * VHM: %s"), *V->GetName()); }
-}
 
-static void ValidateRVTvsLandscapeDomain(const FBox& LandscapeBox_cm, const FBox& RVTBox_cm)
-{
-    const FVector SizeL = LandscapeBox_cm.GetSize();
-    const FVector SizeR = RVTBox_cm.GetSize();
-    auto rel = [](double a,double b){ return (b>1e-3)? FMath::Abs(a-b)/b : 0.0; };
-    const double dx = rel(SizeL.X, SizeR.X), dy = rel(SizeL.Y, SizeR.Y);
-    if (dx > 0.05 || dy > 0.05)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("[Snow] RVT volume size differs from Landscape by >5%% (dx=%.1f%% dy=%.1f%%). Expect clipping/quadrants."),
-            dx*100.0, dy*100.0);
-    }
-}
 
 #if HAS_VHM_ACTOR && HAS_RVT_VOLUME
 static void SyncVHMBoundsToRVT(AVirtualHeightfieldMesh* VHMActor, ARuntimeVirtualTextureVolume* RVTVol)
@@ -307,15 +281,7 @@ void ASnowSimulationActor::BeginPlay()
 	// Safety: remove any legacy procedural mesh components
 	RemoveLegacyProcMeshComponents(this);
 
-	if (bAutoSnapAtBeginPlay)
-	{
-		FTimerHandle H;
-		GetWorldTimerManager().SetTimer(H, [this]()
-		{
-			SnowHere(2016.f);
-		}, 0.05f, false);
-	}
-	InitGrid();
+        InitGrid();
 	if (!WeatherProvider && WeatherProviderClass.IsValid())
 	{
 		UClass* Cls = WeatherProviderClass.LoadSynchronous();
@@ -324,11 +290,7 @@ void ASnowSimulationActor::BeginPlay()
 			WeatherProvider = NewObject<UStochasticWeatherProvider>(this, Cls, NAME_None, RF_Transactional);
 		}
 	}
-	if (!Redistributor)
-	{
-		Redistributor = NewObject<URidgeLeewardRedistributor>(this, URidgeLeewardRedistributor::StaticClass(), NAME_None, RF_Transactional);
-	}
-	CurrentSimTime = StartTime;
+       CurrentSimTime = StartTime;
 	UE_LOG(LogUnrealSnow, Display, TEXT("Grid init: %d x %d (%d cells)"), GridSizeXY, GridSizeXY, NumCells);
 	EnsureResources();
 
@@ -663,19 +625,18 @@ void ASnowSimulationActor::Tick(float DeltaSeconds)
 	const double dHours = HoursPerSecond * DeltaSeconds;
 	CurrentSimTime += FTimespan::FromSeconds(dHours * 3600.0);
 
-	float Precip_mmph = 0.f;
-	if (WeatherProvider)
-	{
-		FWeatherSample S{};
-		const bool bOk = WeatherProvider->GetForTime_Implementation(CurrentSimTime, S);
-		if (bOk) Precip_mmph = S.Precip_mmph;
-	}
-	if (bForceConstantSnow) { Precip_mmph += DebugSnow_mmph; }
+        float Precip_mmph = 0.f;
+        if (WeatherProvider)
+        {
+                FWeatherSample S{};
+                const bool bOk = WeatherProvider->GetForTime_Implementation(CurrentSimTime, S);
+                if (bOk) Precip_mmph = S.Precip_mmph;
+        }
 
-	for (int32 i = 0; i < NumCells; ++i)
-	{
-		SWE[i] += Precip_mmph * (float)dHours;
-	}
+        for (int32 i = 0; i < NumCells; ++i)
+        {
+                SWE[i] += Precip_mmph * (float)dHours;
+        }
 	// Propagate to procedural mesh SWE grid (convert mm -> meters)
 	{
 		const int32 N = GridSizeXY;
@@ -821,7 +782,7 @@ void ASnowSimulationActor::Tick(float DeltaSeconds)
 					const int32 cy = FMath::Clamp(iy, 0, GridY - 1);
 					const float SWE_m = GetSWE_Clamped(cx, cy);
 					const float depth_m = SWE_m * (rhoWater / FMath::Max(1.f, SnowDensity));
-					v.Z = BaseVerts[vi].Z + depth_m * 100.f * DisplacementScale * DebugDisplacementBoost;
+                                    v.Z = BaseVerts[vi].Z + depth_m * 100.f * DisplacementScale;
 					DynVerts[vi] = v;
 				}
 			}
@@ -869,99 +830,13 @@ void ASnowSimulationActor::RunStep(float DeltaSeconds)
 
 	// 1) Accumulation with dt from tick (in hours)
 	const float DtHours = FMath::Max(DeltaSeconds, 0.0f) / 3600.0f;
-	float Precip_mmph = FMath::Max(Sample.Precip_mmph, 0.0f);
-	if (bForceConstantSnow) { Precip_mmph += DebugSnow_mmph; }
-	const float dSWE = Precip_mmph * DtHours; // [mm]
+        float Precip_mmph = FMath::Max(Sample.Precip_mmph, 0.0f);
+        const float dSWE = Precip_mmph * DtHours; // [mm]
 
-	// Accumulate SWE using optional spatial debug pattern; preserve total mass = dSWE * Num
-	{
-		// First pass: compute sum of weights
-		double sumW = 0.0;
-		if (SnowfallMode == ESnowfallDebugMode::Uniform)
-		{
-			sumW = (double)Num; // all ones
-		}
-		else
-		{
-			for (int32 i = 0; i < Num; ++i)
-			{
-				const int32 ix = i % W;
-				const int32 iy = i / W;
-				float w = 1.0f;
-				switch (SnowfallMode)
-				{
-					case ESnowfallDebugMode::Checkerboard:
-					{
-						const int32 sx = FMath::Max(1, SnowfallCheckerSize);
-						const int32 cx = ix / sx;
-						const int32 cy = iy / sx;
-						w = (((cx + cy) & 1) != 0) ? 1.0f : 0.0f;
-						break;
-					}
-					case ESnowfallDebugMode::RadialGradient:
-					{
-						const float fx = (W > 1) ? ((ix + 0.5f) / (float)W) : 0.5f;
-						const float fy = (H > 1) ? ((iy + 0.5f) / (float)H) : 0.5f;
-						const float dx = fx - 0.5f;
-						const float dy = fy - 0.5f;
-						const float r = FMath::Sqrt(dx*dx + dy*dy);
-						const float rmax = 0.70710678f; // sqrt(0.5^2+0.5^2)
-						w = FMath::Clamp(1.0f - r / rmax, 0.0f, 1.0f);
-						break;
-					}
-					case ESnowfallDebugMode::Noise:
-					{
-						const float n = FMath::PerlinNoise2D(FVector2D((float)ix, (float)iy) * SnowfallNoiseScale); // [-1,1]
-						w = FMath::Clamp(0.5f + 0.5f * n, 0.0f, 1.0f) * FMath::Max(0.0f, SnowfallNoiseIntensity);
-						break;
-					}
-					default: w = 1.0f; break;
-				}
-				sumW += (double)w;
-			}
-		}
-
-		const float scale = (sumW > 1e-6) ? (float)((double)Num / sumW) : 1.0f;
-		for (int32 i = 0; i < Num; ++i)
-		{
-			float w = 1.0f;
-			if (SnowfallMode != ESnowfallDebugMode::Uniform)
-			{
-				const int32 ix = i % W;
-				const int32 iy = i / W;
-				switch (SnowfallMode)
-				{
-					case ESnowfallDebugMode::Checkerboard:
-					{
-						const int32 sx = FMath::Max(1, SnowfallCheckerSize);
-						const int32 cx = ix / sx;
-						const int32 cy = iy / sx;
-						w = (((cx + cy) & 1) != 0) ? 1.0f : 0.0f;
-						break;
-					}
-					case ESnowfallDebugMode::RadialGradient:
-					{
-						const float fx = (W > 1) ? ((ix + 0.5f) / (float)W) : 0.5f;
-						const float fy = (H > 1) ? ((iy + 0.5f) / (float)H) : 0.5f;
-						const float dx = fx - 0.5f;
-						const float dy = fy - 0.5f;
-						const float r = FMath::Sqrt(dx*dx + dy*dy);
-						const float rmax = 0.70710678f;
-						w = FMath::Clamp(1.0f - r / rmax, 0.0f, 1.0f);
-						break;
-					}
-					case ESnowfallDebugMode::Noise:
-					{
-						const float n = FMath::PerlinNoise2D(FVector2D((float)ix, (float)iy) * SnowfallNoiseScale);
-						w = FMath::Clamp(0.5f + 0.5f * n, 0.0f, 1.0f) * FMath::Max(0.0f, SnowfallNoiseIntensity);
-						break;
-					}
-					default: w = 1.0f; break;
-				}
-			}
-			SnowWaterEq_mm[i] += dSWE * w * scale;
-		}
-	}
+        for (int32 i = 0; i < Num; ++i)
+        {
+                SnowWaterEq_mm[i] += dSWE;
+        }
 	// Propagate to procedural mesh SWE grid (convert mm -> meters)
 	{
 		if (W > 1 && H > 1)
@@ -980,24 +855,9 @@ void ASnowSimulationActor::RunStep(float DeltaSeconds)
 
 	// 2) Optional redistribution
 	{
-		// Legacy UObject redistributor path (operates on SWE_mm)
-		if (Redistributor)
-		{
-			const float WindSpeed = ComputeWindSpeed(Sample);
-			const float WindDirFromDeg = ComputeWindDirFromDeg(Sample);
-			ISnowRedistributor::Execute_Apply(
-				Redistributor,
-				GridSize,
-				SnowWaterEq_mm,
-				Slope_deg,
-				Aspect_deg,
-				FVector2D(WindDirFromDeg, 0.0f),
-				WindSpeed);
-		}
-
-		// New CPU redistribution path: operate after SWE->depth mapping, before pushing to RVT/VHM
-		if (Redistribution == ERedistributionMode::WindSlopeCPU)
-		{
+               // New CPU redistribution path: operate after SWE->depth mapping, before pushing to RVT/VHM
+               if (Redistribution == ERedistributionMode::WindSlopeCPU)
+               {
 			// Convert SWE [mm] to depth [m] using density 100 kg/m^3 as in existing mapping (mm/100)
 			static UnrealSnow::Redistribution::FWindSlopeRedistributor SRedistrib;
 			UnrealSnow::Redistribution::FSnowGrid G;
@@ -1027,11 +887,8 @@ void ASnowSimulationActor::RunStep(float DeltaSeconds)
 			float mn = FLT_MAX, mx = 0.0f; for (float v : G.SnowDepth_M){ mn = FMath::Min(mn, v); mx = FMath::Max(mx, v); }
 			UE_LOG(LogTemp, Verbose, TEXT("[Snow][Redistrib] min=%.5fm max=%.5fm Δm this tick=%.6g (avg/px)."), mn, mx, drift);
 
-			// Optional debug dump to a transient RT for QA
-			DumpRedistributionRT(G.SnowDepth_M, W, H);
-
-			// Write back to SWE_mm to keep downstream path unchanged (invert mapping m->mm*100)
-			for (int32 i = 0; i < LocalNumCells; ++i) { SnowWaterEq_mm[i] = FMath::Max(0.0f, G.SnowDepth_M[i] * 100.0f); }
+                        // Write back to SWE_mm to keep downstream path unchanged (invert mapping m->mm*100)
+                        for (int32 i = 0; i < LocalNumCells; ++i) { SnowWaterEq_mm[i] = FMath::Max(0.0f, G.SnowDepth_M[i] * 100.0f); }
 
 			// Persist any terrain heights (if modified externally later) back to member storage
 			GroundH_M = MoveTemp(G.GroundH_M);
@@ -1262,20 +1119,6 @@ void ASnowSimulationActor::UpdateSnowDepthTexture()
 	}
 }
 
-void ASnowSimulationActor::DumpRedistributionRT(const TArray<float>& Depth_m, int32 W, int32 H)
-{
-    if (!bDumpRedistributionOnce) return;
-    bDumpRedistributionOnce = false; // one-off
-    if (W <= 0 || H <= 0) return;
-    UTextureRenderTarget2D*& RT = RedistribDebugRT;
-    if (!RT || RT->SizeX != W || RT->SizeY != H)
-    {
-        USnowRTUtils::InitFloatRT(RT, W, PF_R32_FLOAT);
-    }
-    USnowRTUtils::WriteArrayToRT(RT, Depth_m);
-    UE_LOG(LogTemp, Display, TEXT("[Snow][Redistrib] Dumped redistributed depth to RT %s (%dx%d PF_R32_FLOAT)"), RT ? *RT->GetName() : TEXT("<null>"), W, H);
-}
-
 void ASnowSimulationActor::AfterRedistribution()
 {
     // Maintain temporal pair for VHM material, using SnowDepthTex as Current backing
@@ -1482,7 +1325,6 @@ void ASnowSimulationActor::WireSnowDepthToVHM()
 				if (LandscapeBounds.IsValid && IsValid(Volume))
 				{
 					const FBox RVTBox = Volume->GetComponentsBoundingBox(true);
-					ValidateRVTvsLandscapeDomain(LandscapeBounds, RVTBox);
 				}
 #endif
 			}
@@ -1643,8 +1485,7 @@ void ASnowSimulationActor::RebuildSnowMesh()
 				++hitCount;
 
 				// Draw a few corner markers in world space
-				if ((ix==0||ix==VX-1) && (iy==0||iy==VY-1))
-					DrawDebugSphere(W, Hit.ImpactPoint + FVector(0,0,5), 25.f, 12, FColor::Cyan, false, 10.f, 0, 2.f);
+                                // optional corner markers removed
 			}
 			const int32 vi = VertIndex(ix, iy);
 			BaseVerts[vi] = FVector(xy.X, xy.Y, zLocal);
@@ -1676,12 +1517,12 @@ void ASnowSimulationActor::RebuildSnowMesh()
 			const FVector S = GetActorTransform().TransformPosition(FVector(xy.X, xy.Y,  200000.f));
 			const FVector E = GetActorTransform().TransformPosition(FVector(xy.X, xy.Y, -200000.f));
 			FHitResult H;
-			if (GetWorld()->LineTraceSingleByObjectType(H, S, E,
-				FCollisionObjectQueryParams(ECC_WorldStatic),
-				FCollisionQueryParams(FName("SnowCorner"), true, this)) && H.bBlockingHit)
-			{
-				DrawDebugSphere(GetWorld(), H.ImpactPoint + FVector(0,0,15), 40.f, 12, FColor::Green, false, 10.f, 0, 2.f);
-			}
+                                if (GetWorld()->LineTraceSingleByObjectType(H, S, E,
+                                        FCollisionObjectQueryParams(ECC_WorldStatic),
+                                        FCollisionQueryParams(FName("SnowCorner"), true, this)) && H.bBlockingHit)
+                        {
+                                // debug sphere removed
+                        }
 		};
 		CornerWS(0,0); CornerWS(1,0); CornerWS(0,1); CornerWS(1,1);
 	}
@@ -1708,87 +1549,9 @@ void ASnowSimulationActor::RebuildSnowMesh()
 	UE_LOG(LogTemp, Warning, TEXT("[Snow] Rebuild: Hit=%d of %d (%.1f%%). Actor at %s"),
 		hitCount, (GridX+1)*(GridY+1), 100.f*hitCount/float((GridX+1)*(GridY+1)), *GetActorLocation().ToString());
 
-	DrawDebugBox(W, B.Origin, B.BoxExtent, FColor::Yellow, false, 10.f, 0, 2.f);
 }
 #else
 void ASnowSimulationActor::RebuildSnowMesh(){}
 #endif
 
-
-#if SNOW_WITH_LEGACY_PROCMESH
-void ASnowSimulationActor::SnowMeshInfo()
-{
-	if (!LegacyProcMesh)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[Snow] LegacyProcMesh missing"));
-		return;
-	}
-	const FBoxSphereBounds B = LegacyProcMesh->Bounds;
-	UE_LOG(LogTemp, Log, TEXT("[Snow] Sections:%d  Verts:%d  Bounds O:%s Ext:%s  WorldLoc:%s"),
-		LegacyProcMesh->GetNumSections(), DynVerts.Num(),
-		*B.Origin.ToString(), *B.BoxExtent.ToString(),
-		*GetActorLocation().ToString());
-
-	// Visualize bounds
-	DrawDebugBox(GetWorld(), B.Origin, B.BoxExtent, FColor::Cyan, false, 5.f, 0, 2.f);
-}
-#else
-void ASnowSimulationActor::SnowMeshInfo()
-{
-	// Legacy path disabled; no-op
-}
-#endif
-
-
-void ASnowSimulationActor::SnowMove(float X, float Y, float Z)
-{
-	SetActorLocation(FVector(X, Y, Z));
-	UE_LOG(LogTemp, Warning, TEXT("[Snow] SnowMove -> %s"), *GetActorLocation().ToString());
-	// Legacy procedural mesh removed
-}
-
-
-void ASnowSimulationActor::SnowSize(float SizeMeters)
-{
-	const float S = FMath::Max(1.f, SizeMeters) * 100.f; // m -> cm
-	WorldSizeX = S;
-	WorldSizeY = S;
-	UE_LOG(LogTemp, Warning, TEXT("[Snow] SnowSize set to %.0f cm"), S);
-	// Legacy procedural mesh removed
-}
-
-void ASnowSimulationActor::SnowHere(float SizeMeters)
-{
-	UWorld* W = GetWorld(); if(!W) { UE_LOG(LogTemp, Error, TEXT("[Snow] No world")); return; }
-	APlayerController* PC = UGameplayStatics::GetPlayerController(W, 0); if(!PC) { UE_LOG(LogTemp, Error, TEXT("[Snow] No PC")); return; }
-
-	FVector CamLoc; FRotator CamRot; PC->GetPlayerViewPoint(CamLoc, CamRot);
-	const FVector Start = CamLoc;
-	const FVector End   = CamLoc + CamRot.Vector() * 1000000.f;
-
-	FHitResult Hit;
-	FCollisionQueryParams Q(FName("SnowHere"), true, this);
-	FCollisionObjectQueryParams Obj; Obj.AddObjectTypesToQuery(ECC_WorldStatic); Obj.AddObjectTypesToQuery(ECC_WorldDynamic);
-
-	if (W->LineTraceSingleByObjectType(Hit, Start, End, Obj, Q) && Hit.bBlockingHit)
-	{
-		SetActorLocation(Hit.ImpactPoint + FVector(0,0,10));
-		UE_LOG(LogTemp, Warning, TEXT("[Snow] SnowHere at %s on %s"),
-			*Hit.ImpactPoint.ToString(), *GetNameSafe(Hit.GetActor()));
-		SnowSize(SizeMeters);
-	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("[Snow] SnowHere: camera ray found no ground; move closer and retry."));
-	}
-}
-
-void ASnowSimulationActor::SnowLogCenter()
-{
-	const FVector2D xy(0,0);
-	const FVector S = GetActorTransform().TransformPosition(FVector(xy.X, xy.Y,  200000.f));
-	const FVector E = GetActorTransform().TransformPosition(FVector(xy.X, xy.Y, -200000.f));
-	UE_LOG(LogTemp, Warning, TEXT("[Snow] Center trace Start=%s End=%s Loc=%s Size=%.0f x %.0f (cm)"),
-		*S.ToString(), *E.ToString(), *GetActorLocation().ToString(), WorldSizeX, WorldSizeY);
-}
 

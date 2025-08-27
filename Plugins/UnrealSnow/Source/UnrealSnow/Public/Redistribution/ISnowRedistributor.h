@@ -4,8 +4,7 @@
 
 // Keep this header-only compatible and lightweight. No UObject/UINTERFACE involvement.
 
-// Place the new API in a nested namespace to avoid clashes with the legacy
-// Simulation/ISnowRedistributor UObject interface that may coexist in this module.
+// Place the API in a nested namespace to keep the module lightweight and avoid name clashes.
 namespace UnrealSnow
 {
 namespace Redistribution
