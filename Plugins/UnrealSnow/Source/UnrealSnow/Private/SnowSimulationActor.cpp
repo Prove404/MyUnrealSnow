@@ -533,8 +533,9 @@ void ASnowSimulationActor::BindVHM_Material()
 	UMaterialInterface* BaseMat = LoadObject<UMaterialInterface>(nullptr, MatPath);
 	if (!BaseMat) { UE_LOG(LogTemp, Error, TEXT("[Snow] Can't load base material at %s"), MatPath); return; }
 
-	SnowMID = UMaterialInstanceDynamic::Create(BaseMat, this);
-	TargetComp->SetMaterial(0, SnowMID);
+    SnowMID = UMaterialInstanceDynamic::Create(BaseMat, this);
+    TargetComp->SetMaterial(0, SnowMID);
+    BoundVHMMIDs.Add(SnowMID);
 
 	if (SnowDepthTex)
 	{
@@ -1279,14 +1280,27 @@ void ASnowSimulationActor::DumpRedistributionRT(const TArray<float>& Depth_m, in
 void ASnowSimulationActor::AfterRedistribution()
 {
     // Maintain temporal pair for VHM material, using SnowDepthTex as Current backing
-    if (!SnowWriterMID || !SnowDepthTex) { return; }
+    if (!SnowDepthTex) { return; }
 
     if (!SnowDepthCurrent) { SnowDepthCurrent = SnowDepthTex; }
     if (!SnowDepthPrev)    { SnowDepthPrev    = SnowDepthCurrent; }
 
-    // Bind both to the writer MID; fallback to default names if changed via UPROPERTY
-    SnowWriterMID->SetTextureParameterValue(SnowDepthParam,     SnowDepthCurrent);
-    SnowWriterMID->SetTextureParameterValue(SnowDepthPrevParam, SnowDepthPrev);
+    // Bind both to any writer MID
+    if (SnowWriterMID)
+    {
+        SnowWriterMID->SetTextureParameterValue(SnowDepthParam,     SnowDepthCurrent);
+        SnowWriterMID->SetTextureParameterValue(SnowDepthPrevParam, SnowDepthPrev);
+    }
+
+    // Propagate textures to all bound VHM material instances
+    for (TWeakObjectPtr<UMaterialInstanceDynamic> MIDWeak : BoundVHMMIDs)
+    {
+        if (UMaterialInstanceDynamic* MID = MIDWeak.Get())
+        {
+            MID->SetTextureParameterValue(SnowDepthParam,     SnowDepthCurrent);
+            MID->SetTextureParameterValue(SnowDepthPrevParam, SnowDepthPrev);
+        }
+    }
 
     // Swap after binding
     UTexture2D* Tmp = SnowDepthPrev;
@@ -1376,11 +1390,13 @@ void ASnowSimulationActor::WireSnowDepthToVHM()
 			UE_LOG(LogTemp, Warning, TEXT("[Snow] Created MID on %s slot 0 from %s"), *VHM->GetName(), *BaseMtl->GetName());
 		}
 
-		MID->SetTextureParameterValue("SnowDepthTex", SnowDepthTex);
-		MID->SetScalarParameterValue("DepthRangeMeters", DepthRangeMeters);
-		MID->SetScalarParameterValue("DisplacementScale", DisplacementScale);
-		MID->SetVectorParameterValue("SnowOriginMeters", FLinearColor(OriginMeters.X, OriginMeters.Y, 0, 0));
-		MID->SetVectorParameterValue("SnowInvSizePerMeter", FLinearColor(InvSizePerMeter.X, InvSizePerMeter.Y, 0, 0));
+                MID->SetTextureParameterValue("SnowDepthTex", SnowDepthTex);
+                MID->SetScalarParameterValue("DepthRangeMeters", DepthRangeMeters);
+                MID->SetScalarParameterValue("DisplacementScale", DisplacementScale);
+                MID->SetVectorParameterValue("SnowOriginMeters", FLinearColor(OriginMeters.X, OriginMeters.Y, 0, 0));
+                MID->SetVectorParameterValue("SnowInvSizePerMeter", FLinearColor(InvSizePerMeter.X, InvSizePerMeter.Y, 0, 0));
+
+                BoundVHMMIDs.AddUnique(MID);
 
 		// One-time delayed reapply in case streaming proxies were not loaded yet
 		{
