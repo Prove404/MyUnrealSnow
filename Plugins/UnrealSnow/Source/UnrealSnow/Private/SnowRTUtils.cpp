@@ -25,26 +25,8 @@ bool USnowRTUtils::InitFloatRT(UTextureRenderTarget2D*& RT, int32 Size, EPixelFo
 	RT->AddressX = TA_Clamp;
 	RT->AddressY = TA_Clamp;
 	RT->InitCustomFormat(Size, Size, PF, false);
-	RT->UpdateResourceImmediate(true);
-
-	// One-time debug: write a horizontal gradient on first init for PF_R32_FLOAT targets
-	static bool bDidDebugGradient = false;
-	if (!bDidDebugGradient && PF == PF_R32_FLOAT)
-	{
-		bDidDebugGradient = true;
-		TArray<float> Gradient;
-		Gradient.SetNumUninitialized(Size * Size);
-		for (int32 y = 0; y < Size; ++y)
-		{
-			for (int32 x = 0; x < Size; ++x)
-			{
-				const float v = (Size > 1) ? (static_cast<float>(x) / static_cast<float>(Size - 1)) : 0.0f;
-				Gradient[y * Size + x] = v;
-			}
-		}
-		USnowRTUtils::WriteArrayToRT(RT, Gradient);
-	}
-	return true;
+        RT->UpdateResourceImmediate(true);
+        return true;
 }
 
 void USnowRTUtils::WriteArrayToRT(UTextureRenderTarget2D* RT, const TArray<float>& Data)
